@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-agent-assignment"
+version = "0.1.0"
+description = "Production-style voice agent assignment built with LiveKit, FastAPI, and Chroma"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "chromadb>=1.0.0,<2.0.0",
+  "fastapi>=0.115.0,<1.0.0",
+  "httpx>=0.28.0,<1.0.0",
+  "livekit-agents[deepgram,openai,silero,turn-detector]>=1.4,<1.5",
+  "livekit-api>=1.0.0,<2.0.0",
+  "livekit-plugins-noise-cancellation>=0.2.0,<0.3.0",
+  "openai>=2.0.0,<3.0.0",
+  "pypdf>=5.4.0,<6.0.0",
+  "prometheus-client>=0.21.0,<1.0.0",
+  "pydantic-settings>=2.8.0,<3.0.0",
+  "python-dotenv>=1.0.0,<2.0.0",
+  "uvicorn>=0.34.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0,<9.0.0",
+  "pytest-asyncio>=0.26.0,<1.0.0",
+]
+
+[project.scripts]
+voice-agent-api = "voice_agent.main:run_api"
+voice-agent-worker = "voice_agent.worker:run_worker"
+voice-agent-seed-kb = "voice_agent.seed:main"
+voice-agent-load-test = "voice_agent.load_test:main"
+voice-agent-livekit-smoke = "voice_agent.livekit_smoke:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

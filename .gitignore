@@ -175,6 +175,11 @@ logs/
 *.sqlite3
 *.db
 
+# Project runtime data
+data/chroma/
+data/turn_metrics.jsonl
+KMS/logs/
+
 # =========================
 # Build & Compiled
 # =========================
