@@ -8,6 +8,7 @@ from prometheus_client import CollectorRegistry
 from voice_agent.observability import (
     LiveKitTurnMetricsCollector,
     NetworkQualitySnapshot,
+    RetrievalLatencySnapshot,
     TurnMetricsLog,
     TurnLatencySnapshot,
     VoiceAgentMetrics,
@@ -42,6 +43,24 @@ def test_record_network_quality_updates_estimated_mos() -> None:
     assert 1.0 <= mos <= 4.5
     rendered = metrics.render_latest().decode()
     assert "voice_agent_estimated_mos" in rendered
+
+
+def test_record_retrieval_latency_exposes_stage_metrics() -> None:
+    metrics = VoiceAgentMetrics(registry=CollectorRegistry())
+
+    total = metrics.record_retrieval_latency(
+        RetrievalLatencySnapshot(
+            embedding_ms=100.0,
+            vector_query_ms=80.0,
+            document_load_ms=40.0,
+            rerank_ms=20.0,
+            total_ms=240.0,
+        )
+    )
+
+    assert total == 240.0
+    rendered = metrics.render_latest().decode()
+    assert "voice_agent_retrieval_total_ms" in rendered
 
 
 def test_average_latency_ms_returns_zero_for_empty_input() -> None:

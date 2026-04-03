@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -24,16 +23,7 @@ async def test_deepgram_round_trip_smoke() -> None:
 
 def test_live_chroma_retrieval_smoke() -> None:
     settings = load_settings()
-    kb = KnowledgeBase(
-        persist_dir=Path(settings.chroma_persist_dir),
-        collection_name=settings.kb_collection_name,
-        chroma_host=settings.chroma_host,
-        chroma_api_key=settings.chroma_api_key,
-        chroma_tenant=settings.chroma_tenant,
-        chroma_database=settings.chroma_database,
-        jina_api_key=settings.jina_api_key,
-        jina_embedding_model=settings.jina_embedding_model,
-    )
+    kb = KnowledgeBase.from_settings(settings)
 
     results = kb.search(
         "If I return the policy within ten days, do I get my premium back?",

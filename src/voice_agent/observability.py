@@ -46,6 +46,15 @@ class TurnMetricsLogRecord:
         )
 
 
+@dataclass(slots=True)
+class RetrievalLatencySnapshot:
+    embedding_ms: float
+    vector_query_ms: float
+    document_load_ms: float
+    rerank_ms: float
+    total_ms: float
+
+
 class TurnMetricsLog:
     """Small JSONL log shared between worker and API processes."""
 
@@ -157,6 +166,41 @@ class VoiceAgentMetrics:
             "95th percentile conversational round-trip latency in milliseconds from shared worker turn logs.",
             registry=self.registry,
         )
+        self.retrieval_embedding_ms = Histogram(
+            "voice_agent_retrieval_embedding_ms",
+            "Knowledge retrieval query embedding latency in milliseconds.",
+            registry=self.registry,
+        )
+        self.retrieval_vector_query_ms = Histogram(
+            "voice_agent_retrieval_vector_query_ms",
+            "Knowledge retrieval vector query latency in milliseconds.",
+            registry=self.registry,
+        )
+        self.retrieval_document_load_ms = Histogram(
+            "voice_agent_retrieval_document_load_ms",
+            "Knowledge retrieval document load latency in milliseconds.",
+            registry=self.registry,
+        )
+        self.retrieval_rerank_ms = Histogram(
+            "voice_agent_retrieval_rerank_ms",
+            "Knowledge retrieval rerank latency in milliseconds.",
+            registry=self.registry,
+        )
+        self.retrieval_total_ms = Histogram(
+            "voice_agent_retrieval_total_ms",
+            "Knowledge retrieval total latency in milliseconds.",
+            registry=self.registry,
+        )
+        self.first_audio_latency_ms = Histogram(
+            "voice_agent_first_audio_latency_ms",
+            "Latency in milliseconds from caller turn completion to first agent audio frame.",
+            registry=self.registry,
+        )
+        self.full_response_latency_ms = Histogram(
+            "voice_agent_full_response_latency_ms",
+            "Latency in milliseconds from caller turn completion to completed agent spoken response.",
+            registry=self.registry,
+        )
         self.llm_ttft_avg_ms = Gauge(
             "voice_agent_llm_ttft_avg_ms",
             "Average LLM time-to-first-token in milliseconds from shared worker turn logs.",
@@ -203,6 +247,32 @@ class VoiceAgentMetrics:
             snapshot.total_ms,
         )
         return snapshot.total_ms
+
+    def record_retrieval_latency(self, snapshot: RetrievalLatencySnapshot) -> float:
+        self.retrieval_embedding_ms.observe(snapshot.embedding_ms)
+        self.retrieval_vector_query_ms.observe(snapshot.vector_query_ms)
+        self.retrieval_document_load_ms.observe(snapshot.document_load_ms)
+        self.retrieval_rerank_ms.observe(snapshot.rerank_ms)
+        self.retrieval_total_ms.observe(snapshot.total_ms)
+        logger.info(
+            "Recorded retrieval latency embedding_ms=%s vector_query_ms=%s document_load_ms=%s rerank_ms=%s total_ms=%s",
+            snapshot.embedding_ms,
+            snapshot.vector_query_ms,
+            snapshot.document_load_ms,
+            snapshot.rerank_ms,
+            snapshot.total_ms,
+        )
+        return snapshot.total_ms
+
+    def record_first_audio_latency(self, latency_ms: float) -> float:
+        self.first_audio_latency_ms.observe(latency_ms)
+        logger.info("Recorded first audio latency latency_ms=%s", latency_ms)
+        return latency_ms
+
+    def record_full_response_latency(self, latency_ms: float) -> float:
+        self.full_response_latency_ms.observe(latency_ms)
+        logger.info("Recorded full response latency latency_ms=%s", latency_ms)
+        return latency_ms
 
     def record_retry(self, component: str) -> None:
         self.retry_attempts.labels(component=component).inc()

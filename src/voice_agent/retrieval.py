@@ -1,24 +1,68 @@
 from __future__ import annotations
 
-import hashlib
-import math
-import re
+import threading
+from typing import Literal
 
 import httpx
 
-TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
-LOCAL_EMBEDDING_DIMENSION = 64
 JINA_EMBEDDINGS_URL = "https://api.jina.ai/v1/embeddings"
+LOCAL_JINA_MODEL = "jinaai/jina-embeddings-v5-text-small"
+
+_JINA_CLIENT: httpx.Client | None = None
+_LOCAL_MODEL = None
+_LOCAL_MODEL_LOCK = threading.Lock()
 
 
-def embed_with_jina(
+def _get_jina_client() -> httpx.Client:
+    global _JINA_CLIENT
+    if _JINA_CLIENT is None:
+        _JINA_CLIENT = httpx.Client(timeout=30.0)
+    return _JINA_CLIENT
+
+
+def _get_local_model():
+    global _LOCAL_MODEL
+    with _LOCAL_MODEL_LOCK:
+        if _LOCAL_MODEL is None:
+            from sentence_transformers import SentenceTransformer
+
+            # Tested on Apple M4. Let sentence-transformers pick the device automatically.
+            _LOCAL_MODEL = SentenceTransformer(
+                LOCAL_JINA_MODEL,
+                trust_remote_code=True,
+                model_kwargs={"torch_dtype": "auto"},
+            )
+        return _LOCAL_MODEL
+
+
+def warm_local_model() -> None:
+    _get_local_model()
+
+
+def embed_texts(
+    *,
+    texts: list[str],
+    task: str,
+    provider: Literal["local", "remote"],
+    model: str,
+    api_key: str | None = None,
+) -> list[list[float]]:
+    if provider == "remote":
+        if not api_key:
+            raise ValueError("JINA_API_KEY is required when EMBEDDING_PROVIDER=remote")
+        return _embed_with_jina(texts=texts, task=task, api_key=api_key, model=model)
+
+    return _embed_with_local_model(texts=texts, task=task)
+
+
+def _embed_with_jina(
     *,
     texts: list[str],
     task: str,
     api_key: str,
     model: str,
 ) -> list[list[float]]:
-    response = httpx.post(
+    response = _get_jina_client().post(
         JINA_EMBEDDINGS_URL,
         headers={
             "Content-Type": "application/json",
@@ -30,7 +74,6 @@ def embed_with_jina(
             "normalized": True,
             "input": texts,
         },
-        timeout=30.0,
     )
     response.raise_for_status()
     payload = response.json()
@@ -38,16 +81,22 @@ def embed_with_jina(
     return [item["embedding"] for item in data]
 
 
-def local_embedding(text: str) -> list[float]:
-    vector = [0.0] * LOCAL_EMBEDDING_DIMENSION
-    for token in TOKEN_PATTERN.findall(text.lower()):
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = digest[0] % LOCAL_EMBEDDING_DIMENSION
-        sign = -1.0 if digest[1] % 2 else 1.0
-        weight = 1.0 + (digest[2] / 255.0)
-        vector[index] += sign * weight
+def _embed_with_local_model(
+    *,
+    texts: list[str],
+    task: str,
+) -> list[list[float]]:
+    if task == "retrieval.query":
+        prompt_name = "query"
+    elif task == "retrieval.passage":
+        prompt_name = "document"
+    else:
+        raise ValueError(f"Unsupported local embedding task: {task}")
 
-    norm = math.sqrt(sum(value * value for value in vector))
-    if norm == 0.0:
-        return vector
-    return [round(value / norm, 8) for value in vector]
+    embeddings = _get_local_model().encode(
+        sentences=texts,
+        task="retrieval",
+        prompt_name=prompt_name,
+        normalize_embeddings=True,
+    )
+    return [[float(value) for value in row] for row in embeddings]

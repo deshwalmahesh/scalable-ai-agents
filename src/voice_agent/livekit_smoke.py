@@ -61,6 +61,51 @@ async def _wait_for_agent_participant(room: rtc.Room, timeout_seconds: float) ->
     return await asyncio.wait_for(future, timeout=timeout_seconds)
 
 
+def _describe_track_publications(
+    participant: rtc.RemoteParticipant,
+) -> list[dict[str, str]]:
+    publications: list[dict[str, str]] = []
+    for publication in participant.track_publications.values():
+        publications.append(
+            {
+                "sid": publication.sid,
+                "name": publication.name,
+                "kind": str(publication.kind),
+                "source": str(publication.source),
+                "subscribed": str(publication.subscribed),
+            }
+        )
+    return publications
+
+
+async def _wait_for_agent_audio_track(
+    participant: rtc.RemoteParticipant,
+    timeout_seconds: float,
+) -> rtc.Track | None:
+    started = time.perf_counter()
+    while time.perf_counter() - started < timeout_seconds:
+        for publication in participant.track_publications.values():
+            track = publication.track
+            if track is None:
+                continue
+            if publication.kind == rtc.TrackKind.KIND_AUDIO:
+                logger.info(
+                    "Resolved agent audio track sid=%s name=%s source=%s",
+                    publication.sid,
+                    publication.name,
+                    publication.source,
+                )
+                return track
+        await asyncio.sleep(0.1)
+    logger.info(
+        "Timed out waiting for agent audio track participant=%s timeout_seconds=%s publications=%s",
+        participant.identity,
+        timeout_seconds,
+        _describe_track_publications(participant),
+    )
+    return None
+
+
 async def _publish_question_audio(
     room: rtc.Room,
     tts: deepgram.TTS,
@@ -111,6 +156,13 @@ async def _collect_stream_utterance(
         try:
             event = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
         except asyncio.TimeoutError:
+            break
+        except StopAsyncIteration:
+            logger.info(
+                "Audio stream ended before utterance completed hard_timeout_seconds=%s silence_timeout_seconds=%s",
+                hard_timeout_seconds,
+                silence_timeout_seconds,
+            )
             break
         frame = event.frame
         peak_level = _frame_peak_level(frame)
@@ -205,7 +257,6 @@ async def run_smoke(
     first_response_frame_at: float | None = None
     published_audio: dict[str, Any] = {}
     response_frames: list[rtc.AudioFrame] = []
-
     stream: rtc.AudioStream | None = None
 
     try:
@@ -236,25 +287,70 @@ async def run_smoke(
             room_name,
             agent_participant.identity,
         )
-        stream = rtc.AudioStream.from_participant(
-            participant=agent_participant,
-            track_source=rtc.TrackSource.SOURCE_MICROPHONE,
+        logger.info(
+            "Agent track publications on join room_name=%s tracks=%s",
+            room_name,
+            _describe_track_publications(agent_participant),
+        )
+
+        @room.on("track_published")
+        def on_track_published(
+            publication: rtc.RemoteTrackPublication,
+            participant: rtc.RemoteParticipant,
+        ) -> None:
+            if participant.identity != agent_participant.identity:
+                return
+            logger.info(
+                "Agent track published room_name=%s sid=%s name=%s kind=%s source=%s subscribed=%s",
+                room_name,
+                publication.sid,
+                publication.name,
+                publication.kind,
+                publication.source,
+                publication.subscribed,
+            )
+
+        greeting_track = await _wait_for_agent_audio_track(
+            agent_participant,
+            timeout_seconds=3,
+        )
+        if greeting_track is not None:
+            stream = rtc.AudioStream.from_track(
+                track=greeting_track,
+                sample_rate=24000,
+                num_channels=1,
+                frame_size_ms=20,
+            )
+            greeting = await _collect_stream_utterance(
+                stream,
+                hard_timeout_seconds=12,
+                silence_timeout_seconds=1.2,
+            )
+            logger.info(
+                "Initial greeting probe room_name=%s frame_count=%s",
+                room_name,
+                len(greeting["frames"]),
+            )
+            await stream.aclose()
+            stream = None
+            await asyncio.sleep(0.75)
+        else:
+            logger.info("No initial agent audio track yet room_name=%s", room_name)
+
+        question_started_at = time.perf_counter()
+        published_audio = await _publish_question_audio(room, tts, question_text)
+        response_track = await _wait_for_agent_audio_track(
+            agent_participant,
+            timeout_seconds=15,
+        )
+        if response_track is None:
+            raise RuntimeError("No agent audio track was published after the client question")
+        stream = rtc.AudioStream.from_track(
+            track=response_track,
             sample_rate=24000,
             num_channels=1,
             frame_size_ms=20,
         )
-
-        # The worker sends an initial greeting immediately on join. Consume that first
-        # utterance so the next collected segment is the answer to our published question.
-        await _collect_stream_utterance(
-            stream,
-            hard_timeout_seconds=12,
-            silence_timeout_seconds=1.2,
-        )
-        logger.info("Consumed initial greeting room_name=%s", room_name)
-        await asyncio.sleep(0.75)
-
-        question_started_at = time.perf_counter()
         collect_task = asyncio.create_task(
             _collect_stream_utterance(
                 stream,
@@ -262,7 +358,6 @@ async def run_smoke(
                 silence_timeout_seconds=2.2,
             )
         )
-        published_audio = await _publish_question_audio(room, tts, question_text)
         response_audio = await collect_task
         response_frames = response_audio["frames"]
         first_response_frame_at = response_audio["first_non_silent_at"]

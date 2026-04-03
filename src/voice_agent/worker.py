@@ -9,26 +9,26 @@ import ssl
 import aiohttp
 import certifi
 from dotenv import load_dotenv
+from google.genai import types as google_types
 from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
     ConversationItemAddedEvent,
-    FunctionToolsExecutedEvent,
     JobContext,
     JobProcess,
-    UserInputTranscribedEvent,
-    RunContext,
     cli,
-    function_tool,
+    llm,
     room_io,
+    UserInputTranscribedEvent,
 )
-from livekit.plugins import deepgram, noise_cancellation, openai, silero
+from livekit.plugins import cartesia, deepgram, google, noise_cancellation, openai, silero
 
-from voice_agent.kb import KnowledgeBase
+from voice_agent.kb import KnowledgeBase, KnowledgeMatch
 from voice_agent.observability import (
     LiveKitTurnMetricsCollector,
+    RetrievalLatencySnapshot,
     TurnMetricsLog,
     VoiceAgentMetrics,
 )
@@ -46,20 +46,21 @@ def _certifi_default_context(*args: object, **kwargs: object) -> ssl.SSLContext:
     return _ORIGINAL_CREATE_DEFAULT_CONTEXT(*args, **kwargs)
 
 
-def _certifi_client_session(*args: object, **kwargs: object) -> aiohttp.ClientSession:
-    if "connector" not in kwargs:
-        kwargs["connector"] = aiohttp.TCPConnector(
-            ssl=_certifi_default_context(),
-        )
-    return _ORIGINAL_CLIENT_SESSION(*args, **kwargs)
+class _CertifiClientSession(_ORIGINAL_CLIENT_SESSION):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        if "connector" not in kwargs:
+            kwargs["connector"] = aiohttp.TCPConnector(
+                ssl=_certifi_default_context(),
+            )
+        super().__init__(*args, **kwargs)
 
 
-# LiveKit worker uses aiohttp/websocket connections under the hood. On this
-# machine the system trust store is incomplete, so we patch both the default SSL
-# context and aiohttp's default client session to use certifi's CA bundle
-# without disabling verification.
+# aiohttp's own docs recommend supplying a TCPConnector with a certifi-backed
+# SSL context when the system CA store is incomplete. LiveKit's AgentServer
+# does not expose session injection, so we patch ClientSession with a subclass
+# that preserves aiohttp's class interface while supplying that connector.
 ssl.create_default_context = _certifi_default_context
-aiohttp.ClientSession = _certifi_client_session
+aiohttp.ClientSession = _CertifiClientSession
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 _RUNTIME_SETTINGS: AppSettings | None = None
@@ -73,53 +74,99 @@ class WorkerRuntime:
     server: AgentServer
     agent_name: str
 
+
 class SupportAgent(Agent):
-    def __init__(self, knowledge_base: KnowledgeBase) -> None:
-        super().__init__(instructions=build_system_prompt())
-        self._knowledge_base = knowledge_base
-
-    @function_tool()
-    async def search_support_knowledge(
+    def __init__(
         self,
-        context: RunContext,
-        query: str,
-    ) -> dict[str, object]:
-        """Search the policy knowledge base using the caller's own wording.
+        knowledge_base: KnowledgeBase,
+        metrics: VoiceAgentMetrics | None = None,
+    ) -> None:
+        super().__init__(
+            instructions=build_system_prompt(),
+            allow_interruptions=True,
+            min_endpointing_delay=0.15,
+            max_endpointing_delay=0.6,
+        )
+        self._knowledge_base = knowledge_base
+        self._metrics = metrics
 
-        Args:
-            query: Pass the caller's question with minimal cleanup. Preserve numbers,
-                dates, and core terms instead of rewriting it into a search phrase.
-        """
+    async def on_user_turn_completed(
+        self,
+        turn_ctx: llm.ChatContext,
+        new_message: llm.ChatMessage,
+    ) -> None:
+        query = (new_message.text_content or "").strip()
+        if not query:
+            return
 
-        del context
-        logger.info("Knowledge tool invoked query=%s", query)
-        matches = self._knowledge_base.search(query, limit=2)
+        logger.info("Knowledge retrieval started query=%s", query)
+        matches, trace = await self._knowledge_base.async_search_with_trace(query, limit=1)
+        if self._metrics is not None:
+            self._metrics.record_retrieval_latency(
+                RetrievalLatencySnapshot(
+                    embedding_ms=trace.embedding_ms,
+                    vector_query_ms=trace.vector_query_ms,
+                    document_load_ms=trace.document_load_ms,
+                    rerank_ms=trace.rerank_ms,
+                    total_ms=trace.total_ms,
+                )
+            )
         logger.info(
-            "Knowledge tool returning matches query=%s match_count=%s match_titles=%s",
+            "Knowledge retrieval completed query=%s match_count=%s match_titles=%s retrieval_trace=%s",
             query,
             len(matches),
             [match.title[:120] for match in matches],
+            {
+                "mode": trace.mode,
+                "embedding_ms": trace.embedding_ms,
+                "vector_query_ms": trace.vector_query_ms,
+                "document_load_ms": trace.document_load_ms,
+                "rerank_ms": trace.rerank_ms,
+                "total_ms": trace.total_ms,
+            },
         )
-        return {
-            "supported": bool(matches),
-            "matches": [
-                {
-                    "title": match.title,
-                    "content": match.content,
-                    "category": match.metadata.get("category", ""),
-                    "source_url": match.metadata.get("source_url", ""),
-                    "score": match.score,
-                    "vector_score": match.vector_score,
-                    "lexical_score": match.lexical_score,
-                }
-                for match in matches
-            ],
-            "message": (
-                "No grounded policy excerpts were found for this question."
-                if not matches
-                else ""
-            ),
-        }
+        turn_ctx.add_message(
+            role="developer",
+            content=_build_grounding_message(query=query, matches=matches),
+        )
+
+
+def _build_grounding_message(
+    *,
+    query: str,
+    matches: list[KnowledgeMatch],
+) -> str:
+    if not matches:
+        return (
+            "No grounded policy excerpts matched this user turn. "
+            "If the user is asking for policy facts or policy terms, say: "
+            "'I can't answer that from this policy document. Please speak with a human insurance representative.' "
+            "If the user is greeting you or making small talk, answer briefly and naturally."
+        )
+
+    excerpts: list[str] = []
+    for index, match in enumerate(matches, start=1):
+        title = getattr(match, "title", "")
+        content = getattr(match, "content", "")
+        source_url = getattr(match, "metadata", {}).get("source_url", "")
+        excerpts.append(
+            f"[Excerpt {index}] Title: {title}\nContent: {content}\nSource: {source_url}"
+        )
+
+    return (
+        "Grounding for this turn only. Answer using only the policy facts below. "
+        "Do not mention tools, retrieval, or internal process. "
+        "If these excerpts do not fully answer the question, say so briefly instead of guessing.\n\n"
+        f"User question: {query}\n\n" + "\n\n".join(excerpts)
+    )
+
+
+def create_tts(settings: AppSettings) -> deepgram.TTS | cartesia.TTS:
+    if settings.tts_provider == "cartesia":
+        logger.info("Using Cartesia TTS provider")
+        return cartesia.TTS()
+    logger.info("Using Deepgram TTS provider model=aura-2-asteria-en")
+    return deepgram.TTS(model="aura-2-asteria-en")
 
 
 def create_llm(settings: AppSettings) -> openai.LLM:
@@ -132,8 +179,32 @@ def create_llm(settings: AppSettings) -> openai.LLM:
     )
 
 
+def create_gemini_live_model(settings: AppSettings) -> google.realtime.RealtimeModel:
+    modalities = [
+        getattr(google_types.Modality, modality.strip().upper())
+        for modality in settings.gemini_live_modalities.split(",")
+        if modality.strip()
+    ]
+    realtime_kwargs: dict[str, object] = {
+        "model": settings.gemini_live_model,
+        "api_key": settings.google_api_key,
+        "voice": settings.gemini_live_voice,
+        "modalities": modalities,
+        "instructions": build_system_prompt(),
+    }
+    if not settings.gemini_live_include_thoughts:
+        realtime_kwargs["thinking_config"] = google_types.ThinkingConfig(
+            include_thoughts=False,
+        )
+    return google.realtime.RealtimeModel(**realtime_kwargs)
+
+
 def prewarm(proc: JobProcess) -> None:
-    proc.userdata["vad"] = silero.VAD.load()
+    knowledge_base = get_runtime_kb()
+    document_count = knowledge_base.count()
+    if get_runtime_settings().voice_runtime_mode == "cascade":
+        proc.userdata["vad"] = silero.VAD.load()
+    logger.info("Worker prewarm resolved knowledge documents document_count=%s", document_count)
 
 
 def get_runtime_settings() -> AppSettings:
@@ -170,15 +241,30 @@ async def handle_session(ctx: JobContext) -> None:
         settings.agent_name,
         knowledge_base.count(),
     )
-    session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        llm=create_llm(settings),
-        tts=deepgram.TTS(model="aura-2-asteria-en"),
-        vad=ctx.proc.userdata["vad"],
-        # VAD-based turn detection is simpler and avoids a separate model download
-        # while still supporting interruption and spoken turn-taking.
-        turn_detection="vad",
-    )
+    if settings.voice_runtime_mode == "gemini_live":
+        session = AgentSession(
+            llm=create_gemini_live_model(settings),
+        )
+        logger.info(
+            "Configured Gemini Live session room_name=%s model=%s voice=%s modalities=%s",
+            ctx.room.name,
+            settings.gemini_live_model,
+            settings.gemini_live_voice,
+            settings.gemini_live_modalities,
+        )
+    else:
+        session = AgentSession(
+            stt=deepgram.STT(
+                model="nova-3",
+                language="en-US",
+                interim_results=True,
+                smart_format=False,
+            ),
+            llm=create_llm(settings),
+            tts=create_tts(settings),
+            vad=ctx.proc.userdata["vad"],
+            turn_detection="vad",
+        )
     metrics_collector = LiveKitTurnMetricsCollector(metrics)
 
     @session.on("metrics_collected")
@@ -208,16 +294,9 @@ async def handle_session(ctx: JobContext) -> None:
             content,
         )
 
-    @session.on("function_tools_executed")
-    def on_function_tools_executed(event: FunctionToolsExecutedEvent) -> None:
-        logger.info(
-            "Function tools executed count=%s",
-            len(event.function_calls),
-        )
-
     await session.start(
         room=ctx.room,
-        agent=SupportAgent(knowledge_base),
+        agent=SupportAgent(knowledge_base, metrics=metrics),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: (
@@ -229,12 +308,18 @@ async def handle_session(ctx: JobContext) -> None:
             )
         ),
     )
-    await session.say(
-        "Hello, this is the policy support assistant. How can I help you today?",
-        allow_interruptions=True,
-        add_to_chat_ctx=False,
-    )
-    logger.info("Initial agent greeting sent room_name=%s", ctx.room.name)
+    if settings.voice_runtime_mode == "cascade":
+        await session.say(
+            "Hello, this is the policy support assistant. How can I help you today?",
+            allow_interruptions=True,
+            add_to_chat_ctx=False,
+        )
+        logger.info("Initial agent greeting sent room_name=%s", ctx.room.name)
+    else:
+        logger.info(
+            "Skipping explicit greeting for Gemini Live room_name=%s",
+            ctx.room.name,
+        )
 
 
 def create_runtime(
@@ -245,14 +330,27 @@ def create_runtime(
     resolved_settings = settings or load_settings()
     _RUNTIME_SETTINGS = resolved_settings
     _RUNTIME_KB = knowledge_base
-    if _RUNTIME_KB is None:
-        _RUNTIME_KB = get_runtime_kb()
     _RUNTIME_METRICS = VoiceAgentMetrics(
         turn_metrics_log=TurnMetricsLog(Path(resolved_settings.turn_metrics_path))
     )
 
-    server = AgentServer()
+    server_kwargs: dict[str, object] = {
+        "port": resolved_settings.worker_port,
+        "load_threshold": 1.0,
+    }
+    if resolved_settings.embedding_provider == "local":
+        server_kwargs["num_idle_processes"] = 1
+        server_kwargs["initialize_process_timeout"] = 30.0
+
+    server = AgentServer(**server_kwargs)
+    max_sessions = resolved_settings.worker_max_concurrent_sessions
+
+    def worker_load(current_server: AgentServer) -> float:
+        active_jobs = len(current_server.active_jobs)
+        return active_jobs / max_sessions
+
     server.setup_fnc = prewarm
+    server.load_fnc = worker_load
     server.rtc_session(agent_name=resolved_settings.agent_name)(handle_session)
 
     return WorkerRuntime(server=server, agent_name=resolved_settings.agent_name)

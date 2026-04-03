@@ -88,3 +88,13 @@ def test_search_returns_source_metadata(tmp_path: Path) -> None:
 
     assert results
     assert results[0].metadata["source_url"] == "https://example.com/policy.pdf"
+
+
+def test_search_with_trace_reports_timing_metadata(tmp_path: Path) -> None:
+    kb = build_kb(tmp_path)
+
+    results, trace = kb.search_with_trace("How long is the grace period?", limit=1)
+
+    assert results
+    assert trace.mode in {"lexical", "hybrid"}
+    assert trace.total_ms >= 0.0

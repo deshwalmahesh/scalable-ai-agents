@@ -7,6 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 ALLOWED_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+ALLOWED_VOICE_RUNTIME_MODES = {"cascade", "gemini_live"}
+ALLOWED_TTS_PROVIDERS = {"deepgram", "cartesia"}
+ALLOWED_EMBEDDING_PROVIDERS = {"local", "remote"}
+ALLOWED_CHROMA_PROVIDERS = {"local", "remote"}
 
 
 class AppSettings(BaseSettings):
@@ -27,11 +31,15 @@ class AppSettings(BaseSettings):
     twilio_phone_number: str | None = Field(default=None, alias="TWILIO_PHONE_NUMBER")
     twilio_sip_domain: str | None = Field(default=None, alias="TWILIO_SIP_DOMAIN")
     deepgram_api_key: str = Field(..., alias="DEEPGRAM_API_KEY")
+    cartesia_api_key: str | None = Field(default=None, alias="CARTESIA_API_KEY")
+    tts_provider: str = Field(default="deepgram", alias="TTS_PROVIDER")
+    chroma_provider: str = Field(default="local", alias="CHROMA_PROVIDER")
     chroma_host: str = Field(default="api.trychroma.com", alias="CHROMA_HOST")
     chroma_api_key: str | None = Field(default=None, alias="CHROMA_API_KEY")
     chroma_tenant: str | None = Field(default=None, alias="CHROMA_TENANT")
     chroma_database: str | None = Field(default=None, alias="CHROMA_DATABASE")
     jina_api_key: str | None = Field(default=None, alias="JINA_API_KEY")
+    embedding_provider: str = Field(default="local", alias="EMBEDDING_PROVIDER")
     jina_embedding_model: str = Field(
         default="jina-embeddings-v5-text-small",
         alias="JINA_EMBEDDING_MODEL",
@@ -42,6 +50,12 @@ class AppSettings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_llm_model_name: str | None = Field(
         default=None, alias="GEMINI_LLM_MODEL_NAME"
+    )
+    gemini_audio_model_name: str | None = Field(
+        default=None, alias="GEMINI_AUDIO_MODEL_NAME"
+    )
+    gemini_embedding_model_name: str | None = Field(
+        default=None, alias="GEMINI_EMBEDDING_MODEL_NAME"
     )
     chroma_persist_dir: Path = Field(
         default=Path("./data/chroma"), alias="CHROMA_PERSIST_DIR"
@@ -61,7 +75,18 @@ class AppSettings(BaseSettings):
     agent_name: str = Field(default="policy-support-agent", alias="AGENT_NAME")
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8080, alias="API_PORT", ge=1, le=65535)
+    worker_port: int = Field(default=8081, alias="WORKER_PORT", ge=0, le=65535)
+    worker_max_concurrent_sessions: int = Field(
+        default=1,
+        alias="WORKER_MAX_CONCURRENT_SESSIONS",
+        ge=1,
+        le=1000,
+    )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    voice_runtime_mode: str = Field(
+        default="cascade",
+        alias="VOICE_RUNTIME_MODE",
+    )
     http_timeout_seconds: float = Field(
         default=15.0, alias="HTTP_TIMEOUT_SECONDS", gt=0
     )
@@ -90,6 +115,17 @@ class AppSettings(BaseSettings):
         ge=0.0,
         le=1.0,
     )
+    google_api_key: str | None = Field(default=None, alias="GOOGLE_API_KEY")
+    gemini_live_model: str | None = Field(default=None, alias="GEMINI_LIVE_MODEL")
+    gemini_live_voice: str = Field(default="Puck", alias="GEMINI_LIVE_VOICE")
+    gemini_live_include_thoughts: bool = Field(
+        default=False,
+        alias="GEMINI_LIVE_INCLUDE_THOUGHTS",
+    )
+    gemini_live_modalities: str = Field(
+        default="AUDIO",
+        alias="GEMINI_LIVE_MODALITIES",
+    )
     load_test_concurrency: int = Field(
         default=10, alias="LOAD_TEST_CONCURRENCY", ge=1, le=100
     )
@@ -113,6 +149,42 @@ class AppSettings(BaseSettings):
             raise ValueError(f"log level must be one of: {allowed}")
         return normalized
 
+    @field_validator("voice_runtime_mode")
+    @classmethod
+    def validate_voice_runtime_mode(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in ALLOWED_VOICE_RUNTIME_MODES:
+            allowed = ", ".join(sorted(ALLOWED_VOICE_RUNTIME_MODES))
+            raise ValueError(f"VOICE_RUNTIME_MODE must be one of: {allowed}")
+        return normalized
+
+    @field_validator("tts_provider")
+    @classmethod
+    def validate_tts_provider(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in ALLOWED_TTS_PROVIDERS:
+            allowed = ", ".join(sorted(ALLOWED_TTS_PROVIDERS))
+            raise ValueError(f"TTS_PROVIDER must be one of: {allowed}")
+        return normalized
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def validate_embedding_provider(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in ALLOWED_EMBEDDING_PROVIDERS:
+            allowed = ", ".join(sorted(ALLOWED_EMBEDDING_PROVIDERS))
+            raise ValueError(f"EMBEDDING_PROVIDER must be one of: {allowed}")
+        return normalized
+
+    @field_validator("chroma_provider")
+    @classmethod
+    def validate_chroma_provider(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in ALLOWED_CHROMA_PROVIDERS:
+            allowed = ", ".join(sorted(ALLOWED_CHROMA_PROVIDERS))
+            raise ValueError(f"CHROMA_PROVIDER must be one of: {allowed}")
+        return normalized
+
     @model_validator(mode="after")
     def apply_llm_fallbacks(self) -> "AppSettings":
         total_weight = self.kb_embedding_weight + self.kb_lexical_weight
@@ -120,6 +192,24 @@ class AppSettings(BaseSettings):
             raise ValueError(
                 "KB_EMBEDDING_WEIGHT and KB_LEXICAL_WEIGHT must sum to 1.0"
             )
+        if self.embedding_provider == "remote" and not self.jina_api_key:
+            raise ValueError(
+                "JINA_API_KEY is required when EMBEDDING_PROVIDER=remote"
+            )
+        if self.chroma_provider == "remote":
+            missing_chroma = []
+            if not self.chroma_api_key:
+                missing_chroma.append("CHROMA_API_KEY")
+            if not self.chroma_tenant:
+                missing_chroma.append("CHROMA_TENANT")
+            if not self.chroma_database:
+                missing_chroma.append("CHROMA_DATABASE")
+            if missing_chroma:
+                raise ValueError(
+                    "Missing remote Chroma configuration: " + ", ".join(missing_chroma)
+                )
+        self.google_api_key = self.google_api_key or self.gemini_api_key
+        self.gemini_live_model = self.gemini_live_model or self.gemini_audio_model_name
         self.openai_api_key = self.openai_api_key or self.gemini_api_key
         self.openai_model = self.openai_model or self.gemini_llm_model_name
         if not self.openai_base_url and self.gemini_api_key:

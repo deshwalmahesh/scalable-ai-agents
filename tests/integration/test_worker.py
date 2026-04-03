@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from livekit.plugins import openai
+from livekit.plugins import google, openai
+from livekit.agents import llm
 
 from voice_agent.kb import KnowledgeBase, KnowledgeDocument
 from voice_agent.settings import AppSettings
-from voice_agent.worker import SupportAgent, create_llm, create_runtime
+from voice_agent.worker import (
+    SupportAgent,
+    create_gemini_live_model,
+    create_llm,
+    create_runtime,
+)
 
 
 TEST_DOCUMENTS = [
@@ -57,14 +63,39 @@ def test_create_runtime_uses_configured_agent_name(tmp_path: Path) -> None:
     assert runtime.agent_name == "support-agent"
 
 
-async def test_support_agent_tool_returns_matches(tmp_path: Path) -> None:
+def test_create_runtime_uses_capacity_based_load_function(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path, WORKER_MAX_CONCURRENT_SESSIONS=4)
+
+    runtime = create_runtime(settings=settings)
+
+    assert runtime.server._load_threshold == 1.0
+    assert runtime.server.load_fnc is not None
+
+
+def test_create_gemini_live_model_uses_google_plugin(tmp_path: Path) -> None:
+    settings = build_settings(
+        tmp_path,
+        VOICE_RUNTIME_MODE="gemini_live",
+        GOOGLE_API_KEY="google-key",
+        GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
+    )
+
+    model = create_gemini_live_model(settings)
+
+    assert isinstance(model, google.realtime.RealtimeModel)
+
+
+async def test_support_agent_injects_grounding_into_turn_context(tmp_path: Path) -> None:
     kb = KnowledgeBase(tmp_path / "chroma", "test-collection")
     kb.upsert_documents(TEST_DOCUMENTS)
     agent = SupportAgent(kb)
-
-    result = await agent.search_support_knowledge(
-        None,
-        "If I return the policy within ten days, do I get my premium back?",
+    turn_ctx = llm.ChatContext.empty()
+    new_message = turn_ctx.add_message(
+        role="user",
+        content="If I return the policy within ten days, do I get my premium back?",
     )
 
-    assert result["matches"]
+    await agent.on_user_turn_completed(turn_ctx, new_message)
+
+    assert len(turn_ctx.messages()) == 2
+    assert "Grounding for this turn only" in str(turn_ctx.messages()[-1].text_content)

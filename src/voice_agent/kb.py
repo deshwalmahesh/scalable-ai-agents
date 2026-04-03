@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 import re
+import time
 
 import chromadb
 
 from voice_agent.data.knowledge_documents import KnowledgeDocument
-from voice_agent.retrieval import embed_with_jina, local_embedding
+from voice_agent.retrieval import embed_texts, warm_local_model
 from voice_agent.settings import AppSettings
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
@@ -56,6 +58,16 @@ class KnowledgeMatch:
     metadata: dict[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class SearchTrace:
+    mode: str
+    embedding_ms: float
+    vector_query_ms: float
+    document_load_ms: float
+    rerank_ms: float
+    total_ms: float
+
+
 class KnowledgeBase:
     """Thin wrapper around a Chroma collection for grounded support content."""
 
@@ -64,12 +76,14 @@ class KnowledgeBase:
         return cls(
             persist_dir=Path(settings.chroma_persist_dir),
             collection_name=settings.kb_collection_name,
+            chroma_provider=settings.chroma_provider,
             chroma_host=settings.chroma_host,
             chroma_api_key=settings.chroma_api_key,
             chroma_tenant=settings.chroma_tenant,
             chroma_database=settings.chroma_database,
             jina_api_key=settings.jina_api_key,
             jina_embedding_model=settings.jina_embedding_model,
+            embedding_provider=settings.embedding_provider,
             embedding_weight=settings.kb_embedding_weight,
             lexical_weight=settings.kb_lexical_weight,
             min_combined_score=settings.kb_min_combined_score,
@@ -81,12 +95,14 @@ class KnowledgeBase:
         persist_dir: Path,
         collection_name: str,
         *,
+        chroma_provider: str | None = None,
         chroma_host: str | None = None,
         chroma_api_key: str | None = None,
         chroma_tenant: str | None = None,
         chroma_database: str | None = None,
         jina_api_key: str | None = None,
         jina_embedding_model: str = "jina-embeddings-v5-text-small",
+        embedding_provider: str = "lexical",
         embedding_weight: float = 0.7,
         lexical_weight: float = 0.3,
         min_combined_score: float = 0.45,
@@ -96,11 +112,19 @@ class KnowledgeBase:
         self._collection_name = collection_name
         self._jina_api_key = jina_api_key
         self._jina_embedding_model = jina_embedding_model
+        self._embedding_provider = embedding_provider
         self._embedding_weight = embedding_weight
         self._lexical_weight = lexical_weight
         self._min_combined_score = min_combined_score
         self._min_vector_score = min_vector_score
-        if should_use_cloud_client(chroma_api_key, chroma_tenant, chroma_database):
+        use_cloud_client = (
+            chroma_provider == "remote"
+            if chroma_provider is not None
+            else should_use_cloud_client(chroma_api_key, chroma_tenant, chroma_database)
+        )
+        if self._embedding_provider == "local":
+            warm_local_model()
+        if use_cloud_client:
             self._client = chromadb.CloudClient(
                 api_key=chroma_api_key,
                 tenant=chroma_tenant,
@@ -121,25 +145,46 @@ class KnowledgeBase:
             self._collection_name,
             len(documents),
         )
-        self._collection.upsert(
-            ids=[document.id for document in documents],
-            documents=[document.content for document in documents],
-            metadatas=[
+        payload = {
+            "ids": [document.id for document in documents],
+            "documents": [document.content for document in documents],
+            "metadatas": [
                 {"title": document.title, **document.metadata} for document in documents
             ],
-            embeddings=self._embed_texts(
+        }
+        if self._embedding_provider != "lexical":
+            payload["embeddings"] = self._embed_texts(
                 [document.content for document in documents],
                 task="retrieval.passage",
-            ),
-        )
+            )
+        self._collection.upsert(**payload)
 
     def count(self) -> int:
         return self._collection.count()
 
     def search(self, query: str, limit: int = 3) -> list[KnowledgeMatch]:
+        matches, _ = self.search_with_trace(query, limit)
+        return matches
+
+    async def async_search_with_trace(
+        self,
+        query: str,
+        limit: int = 3,
+    ) -> tuple[list[KnowledgeMatch], SearchTrace]:
+        return await asyncio.to_thread(self.search_with_trace, query, limit)
+
+    def search_with_trace(self, query: str, limit: int = 3) -> tuple[list[KnowledgeMatch], SearchTrace]:
         query_text = query.strip().lower()
         if not query_text:
-            return []
+            return [], SearchTrace(
+                mode="empty",
+                embedding_ms=0.0,
+                vector_query_ms=0.0,
+                document_load_ms=0.0,
+                rerank_ms=0.0,
+                total_ms=0.0,
+            )
+        started_at = time.perf_counter()
         document_count = self._collection.count()
         if document_count == 0:
             logger.warning(
@@ -147,51 +192,69 @@ class KnowledgeBase:
                 self._collection_name,
                 query_text,
             )
-            return []
-        if not self._jina_api_key:
+            return [], SearchTrace(
+                mode="empty_collection",
+                embedding_ms=0.0,
+                vector_query_ms=0.0,
+                document_load_ms=0.0,
+                rerank_ms=0.0,
+                total_ms=round((time.perf_counter() - started_at) * 1000, 2),
+            )
+        if self._embedding_provider == "lexical":
             matches = self._lexical_search(query_text, limit)
             self._log_search_results(query_text, matches, mode="lexical")
-            return matches
+            return matches, SearchTrace(
+                mode="lexical",
+                embedding_ms=0.0,
+                vector_query_ms=0.0,
+                document_load_ms=0.0,
+                rerank_ms=round((time.perf_counter() - started_at) * 1000, 2),
+                total_ms=round((time.perf_counter() - started_at) * 1000, 2),
+            )
 
-        matches = self._hybrid_search(query_text, limit, document_count)
+        matches, trace = self._hybrid_search(query_text, limit, document_count)
         self._log_search_results(query_text, matches, mode="hybrid")
-        return matches
+        return matches, trace
 
     def _embed_texts(self, texts: list[str], task: str) -> list[list[float]]:
-        if self._jina_api_key:
-            return embed_with_jina(
-                texts=texts,
-                task=task,
-                api_key=self._jina_api_key,
-                model=self._jina_embedding_model,
-            )
-        return [local_embedding(text) for text in texts]
+        return embed_texts(
+            texts=texts,
+            task=task,
+            provider=self._embedding_provider,
+            api_key=self._jina_api_key,
+            model=self._jina_embedding_model,
+        )
 
     def _lexical_search(self, query_text: str, limit: int) -> list[KnowledgeMatch]:
         records = self._collection.get(
             limit=max(self._collection.count(), limit),
             include=["documents", "metadatas"],
         )
-        ids = records.get("ids", [])
-        documents = records.get("documents", []) or []
-        metadatas = records.get("metadatas", []) or []
         matches: list[KnowledgeMatch] = []
 
-        for doc_id, content, metadata in zip(ids, documents, metadatas, strict=False):
-            metadata = metadata or {}
-            title = str(metadata.get("title", ""))
-            score = lexical_score(query_text, title, str(content))
+        for doc_id, content, metadata in zip(
+            records.get("ids", []),
+            records.get("documents", []) or [],
+            records.get("metadatas", []) or [],
+            strict=False,
+        ):
+            resolved_metadata = {
+                key: str(value) for key, value in (metadata or {}).items()
+            }
+            title = resolved_metadata.get("title", "")
+            resolved_content = str(content or "")
+            score = lexical_score(query_text, title, resolved_content)
             if score <= 0:
                 continue
             matches.append(
                 KnowledgeMatch(
                     id=str(doc_id),
                     title=title,
-                    content=str(content),
+                    content=resolved_content,
                     score=float(score),
                     vector_score=0.0,
                     lexical_score=float(score),
-                    metadata={key: str(value) for key, value in metadata.items()},
+                    metadata=resolved_metadata,
                 )
             )
 
@@ -203,38 +266,50 @@ class KnowledgeBase:
         query_text: str,
         limit: int,
         document_count: int,
-    ) -> list[KnowledgeMatch]:
+    ) -> tuple[list[KnowledgeMatch], SearchTrace]:
+        started_at = time.perf_counter()
+        embedding_started_at = time.perf_counter()
         query_embedding = self._embed_texts([query_text], task="retrieval.query")[0]
+        embedding_ms = round((time.perf_counter() - embedding_started_at) * 1000, 2)
         candidate_limit = min(max(limit * 6, 10), document_count)
+        vector_query_started_at = time.perf_counter()
         query_results = self._collection.query(
             query_embeddings=[query_embedding],
             n_results=candidate_limit,
+            include=["documents", "metadatas", "distances"],
         )
+        vector_query_ms = round(
+            (time.perf_counter() - vector_query_started_at) * 1000,
+            2,
+        )
+        document_load_ms = 0.0
+        matches: list[KnowledgeMatch] = []
+        rerank_started_at = time.perf_counter()
+        result_ids = [str(value) for value in query_results.get("ids", [[]])[0]]
+        result_documents = query_results.get("documents", [[]])[0] or []
+        result_metadatas = query_results.get("metadatas", [[]])[0] or []
         candidate_scores = build_vector_score_map(
-            ids=query_results.get("ids", [[]])[0],
+            ids=result_ids,
             distances=query_results.get("distances", [[]])[0],
         )
-        records = self._collection.get(
-            limit=document_count,
-            include=["documents", "metadatas"],
-        )
-        matches: list[KnowledgeMatch] = []
         lexical_scores: list[tuple[str, float]] = []
 
         for doc_id, content, metadata in zip(
-            records.get("ids", []),
-            records.get("documents", []) or [],
-            records.get("metadatas", []) or [],
+            result_ids,
+            result_documents,
+            result_metadatas,
             strict=False,
         ):
-            metadata = metadata or {}
+            resolved_metadata = {
+                key: str(value) for key, value in (metadata or {}).items()
+            }
             lexical_scores.append(
                 (
-                    str(doc_id),
+                    doc_id,
                     lexical_coverage_score(
                         query_text,
-                        str(metadata.get("title", "")),
-                        str(content),
+                        resolved_metadata.get("title", ""),
+                        str(content or ""),
                     ),
                 )
             )
@@ -246,15 +321,16 @@ class KnowledgeBase:
         }
 
         for doc_id, content, metadata in zip(
-            records.get("ids", []),
-            records.get("documents", []) or [],
-            records.get("metadatas", []) or [],
+            result_ids,
+            result_documents,
+            result_metadatas,
             strict=False,
         ):
-            metadata = metadata or {}
-            title = str(metadata.get("title", ""))
-            lexical = lexical_map.get(str(doc_id), 0.0)
-            vector = candidate_scores.get(str(doc_id), 0.0)
+            resolved_metadata = {
+                key: str(value) for key, value in (metadata or {}).items()
+            }
+            lexical = lexical_map.get(doc_id, 0.0)
+            vector = candidate_scores.get(doc_id, 0.0)
             combined_score = (
                 self._embedding_weight * vector
                 + self._lexical_weight * lexical
@@ -266,18 +342,27 @@ class KnowledgeBase:
                 continue
             matches.append(
                 KnowledgeMatch(
-                    id=str(doc_id),
-                    title=title,
-                    content=str(content),
+                    id=doc_id,
+                    title=resolved_metadata.get("title", ""),
+                    content=str(content or ""),
                     score=round(combined_score, 4),
                     vector_score=round(vector, 4),
                     lexical_score=round(lexical, 4),
-                    metadata={key: str(value) for key, value in metadata.items()},
+                    metadata=resolved_metadata,
                 )
             )
 
         matches.sort(key=lambda match: match.score, reverse=True)
-        return matches[:limit]
+        rerank_ms = round((time.perf_counter() - rerank_started_at) * 1000, 2)
+        total_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        return matches[:limit], SearchTrace(
+            mode="hybrid",
+            embedding_ms=embedding_ms,
+            vector_query_ms=vector_query_ms,
+            document_load_ms=document_load_ms,
+            rerank_ms=rerank_ms,
+            total_ms=total_ms,
+        )
 
     def _log_search_results(
         self,
@@ -355,6 +440,14 @@ def lexical_coverage_score(query: str, title: str, content: str) -> float:
         return 0.0
 
     document_tokens = set(tokenize(f"{title} {content}"))
+    return lexical_coverage_score_from_tokens(query, document_tokens)
+
+
+def lexical_coverage_score_from_tokens(query: str, document_tokens: set[str]) -> float:
+    query_tokens = significant_tokens(query)
+    if not query_tokens:
+        return 0.0
+
     matched = 0
     for token in query_tokens:
         if token in document_tokens or any(
