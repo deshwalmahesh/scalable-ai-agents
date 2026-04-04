@@ -5,7 +5,7 @@ from pathlib import Path
 from livekit.plugins import google, openai
 from livekit.agents import llm
 
-from voice_agent.kb import KnowledgeBase, KnowledgeDocument
+from voice_agent.kb import KnowledgeBase, KnowledgeDocument, RetrievalService
 from voice_agent.settings import AppSettings
 from voice_agent.worker import (
     SupportAgent,
@@ -88,7 +88,7 @@ def test_create_gemini_live_model_uses_google_plugin(tmp_path: Path) -> None:
 async def test_support_agent_injects_grounding_into_turn_context(tmp_path: Path) -> None:
     kb = KnowledgeBase(tmp_path / "chroma", "test-collection")
     kb.upsert_documents(TEST_DOCUMENTS)
-    agent = SupportAgent(kb)
+    agent = SupportAgent(RetrievalService(kb))
     turn_ctx = llm.ChatContext.empty()
     new_message = turn_ctx.add_message(
         role="user",
@@ -99,3 +99,38 @@ async def test_support_agent_injects_grounding_into_turn_context(tmp_path: Path)
 
     assert len(turn_ctx.messages()) == 2
     assert "Grounding for this turn only" in str(turn_ctx.messages()[-1].text_content)
+
+
+async def test_support_agent_skips_retrieval_for_small_talk(tmp_path: Path) -> None:
+    kb = KnowledgeBase(tmp_path / "chroma", "test-collection")
+    kb.upsert_documents(TEST_DOCUMENTS)
+    agent = SupportAgent(RetrievalService(kb))
+    turn_ctx = llm.ChatContext.empty()
+    new_message = turn_ctx.add_message(role="user", content="hello")
+
+    await agent.on_user_turn_completed(turn_ctx, new_message)
+
+    assert len(turn_ctx.messages()) == 2
+    assert "small talk or a connection check" in str(turn_ctx.messages()[-1].text_content)
+
+
+async def test_support_agent_combines_split_user_turns_for_grounding(tmp_path: Path) -> None:
+    kb = KnowledgeBase(tmp_path / "chroma", "test-collection")
+    kb.upsert_documents(TEST_DOCUMENTS)
+    agent = SupportAgent(RetrievalService(kb))
+    turn_ctx = llm.ChatContext.empty()
+    turn_ctx.add_message(
+        role="user",
+        content="If I return the policy within ten days, do I get my",
+    )
+    turn_ctx.add_message(
+        role="developer",
+        content="Grounding for this turn only. Answer using policy facts.",
+    )
+    new_message = turn_ctx.add_message(role="user", content="premium back?")
+
+    await agent.on_user_turn_completed(turn_ctx, new_message)
+
+    assert "If I return the policy within ten days, do I get my premium back?" in str(
+        turn_ctx.messages()[-1].text_content
+    )

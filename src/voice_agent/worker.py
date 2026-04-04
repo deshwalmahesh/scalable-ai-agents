@@ -25,8 +25,9 @@ from livekit.agents import (
 )
 from livekit.plugins import cartesia, deepgram, google, noise_cancellation, openai, silero
 
-from voice_agent.kb import KnowledgeBase, KnowledgeMatch
+from voice_agent.kb import KnowledgeBase, RetrievalService
 from voice_agent.observability import (
+    ActiveSessionsStore,
     LiveKitTurnMetricsCollector,
     RetrievalLatencySnapshot,
     TurnMetricsLog,
@@ -65,6 +66,7 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 _RUNTIME_SETTINGS: AppSettings | None = None
 _RUNTIME_KB: KnowledgeBase | None = None
+_RUNTIME_RETRIEVAL: RetrievalService | None = None
 _RUNTIME_METRICS: VoiceAgentMetrics | None = None
 logger = logging.getLogger(__name__)
 
@@ -78,7 +80,7 @@ class WorkerRuntime:
 class SupportAgent(Agent):
     def __init__(
         self,
-        knowledge_base: KnowledgeBase,
+        retrieval_service: RetrievalService,
         metrics: VoiceAgentMetrics | None = None,
     ) -> None:
         super().__init__(
@@ -87,7 +89,7 @@ class SupportAgent(Agent):
             min_endpointing_delay=0.15,
             max_endpointing_delay=0.6,
         )
-        self._knowledge_base = knowledge_base
+        self._retrieval_service = retrieval_service
         self._metrics = metrics
 
     async def on_user_turn_completed(
@@ -95,12 +97,24 @@ class SupportAgent(Agent):
         turn_ctx: llm.ChatContext,
         new_message: llm.ChatMessage,
     ) -> None:
-        query = (new_message.text_content or "").strip()
+        query = self._build_grounding_query(turn_ctx, new_message)
         if not query:
             return
 
+        if not self._retrieval_service.should_ground(query):
+            logger.info("Knowledge retrieval skipped query=%s reason=non_policy_turn", query)
+            turn_ctx.add_message(
+                role="developer",
+                content=(
+                    "This user turn is conversational small talk or a connection check. "
+                    "Answer briefly and naturally without citing policy facts."
+                ),
+            )
+            return
+
         logger.info("Knowledge retrieval started query=%s", query)
-        matches, trace = await self._knowledge_base.async_search_with_trace(query, limit=1)
+        retrieval = await self._retrieval_service.async_ground(query, limit=1)
+        trace = retrieval.trace
         if self._metrics is not None:
             self._metrics.record_retrieval_latency(
                 RetrievalLatencySnapshot(
@@ -114,8 +128,8 @@ class SupportAgent(Agent):
         logger.info(
             "Knowledge retrieval completed query=%s match_count=%s match_titles=%s retrieval_trace=%s",
             query,
-            len(matches),
-            [match.title[:120] for match in matches],
+            len(retrieval.matches),
+            [match.title[:120] for match in retrieval.matches],
             {
                 "mode": trace.mode,
                 "embedding_ms": trace.embedding_ms,
@@ -127,38 +141,35 @@ class SupportAgent(Agent):
         )
         turn_ctx.add_message(
             role="developer",
-            content=_build_grounding_message(query=query, matches=matches),
+            content=retrieval.grounding_message,
         )
 
+    @staticmethod
+    def _build_grounding_query(
+        turn_ctx: llm.ChatContext,
+        new_message: llm.ChatMessage,
+    ) -> str:
+        latest_text = (new_message.text_content or "").strip()
+        if not latest_text:
+            return ""
 
-def _build_grounding_message(
-    *,
-    query: str,
-    matches: list[KnowledgeMatch],
-) -> str:
-    if not matches:
-        return (
-            "No grounded policy excerpts matched this user turn. "
-            "If the user is asking for policy facts or policy terms, say: "
-            "'I can't answer that from this policy document. Please speak with a human insurance representative.' "
-            "If the user is greeting you or making small talk, answer briefly and naturally."
-        )
+        fragments: list[str] = []
+        seen_new_message = False
+        for message in reversed(turn_ctx.messages()):
+            if message is new_message:
+                seen_new_message = True
+            if not seen_new_message:
+                continue
+            if message.role == "assistant":
+                break
+            if message.role != "user":
+                continue
+            text = (message.text_content or "").strip()
+            if text:
+                fragments.append(text)
 
-    excerpts: list[str] = []
-    for index, match in enumerate(matches, start=1):
-        title = getattr(match, "title", "")
-        content = getattr(match, "content", "")
-        source_url = getattr(match, "metadata", {}).get("source_url", "")
-        excerpts.append(
-            f"[Excerpt {index}] Title: {title}\nContent: {content}\nSource: {source_url}"
-        )
-
-    return (
-        "Grounding for this turn only. Answer using only the policy facts below. "
-        "Do not mention tools, retrieval, or internal process. "
-        "If these excerpts do not fully answer the question, say so briefly instead of guessing.\n\n"
-        f"User question: {query}\n\n" + "\n\n".join(excerpts)
-    )
+        fragments.reverse()
+        return " ".join(fragments).strip()
 
 
 def create_tts(settings: AppSettings) -> deepgram.TTS | cartesia.TTS:
@@ -200,8 +211,8 @@ def create_gemini_live_model(settings: AppSettings) -> google.realtime.RealtimeM
 
 
 def prewarm(proc: JobProcess) -> None:
-    knowledge_base = get_runtime_kb()
-    document_count = knowledge_base.count()
+    retrieval_service = get_runtime_retrieval()
+    document_count = retrieval_service.count()
     if get_runtime_settings().voice_runtime_mode == "cascade":
         proc.userdata["vad"] = silero.VAD.load()
     logger.info("Worker prewarm resolved knowledge documents document_count=%s", document_count)
@@ -221,25 +232,39 @@ def get_runtime_kb() -> KnowledgeBase:
     return _RUNTIME_KB
 
 
+def get_runtime_retrieval() -> RetrievalService:
+    global _RUNTIME_RETRIEVAL
+    if _RUNTIME_RETRIEVAL is None:
+        _RUNTIME_RETRIEVAL = RetrievalService(get_runtime_kb())
+    return _RUNTIME_RETRIEVAL
+
+
 def get_runtime_metrics() -> VoiceAgentMetrics:
     global _RUNTIME_METRICS
     if _RUNTIME_METRICS is None:
         settings = get_runtime_settings()
         _RUNTIME_METRICS = VoiceAgentMetrics(
-            turn_metrics_log=TurnMetricsLog(Path(settings.turn_metrics_path))
+            turn_metrics_log=TurnMetricsLog(Path(settings.turn_metrics_path)),
+            active_sessions_store=ActiveSessionsStore(Path(settings.active_sessions_path)),
         )
     return _RUNTIME_METRICS
 
 
 async def handle_session(ctx: JobContext) -> None:
     settings = get_runtime_settings()
-    knowledge_base = get_runtime_kb()
+    retrieval_service = get_runtime_retrieval()
     metrics = get_runtime_metrics()
     logger.info(
         "Starting agent session room_name=%s agent_name=%s kb_documents=%s",
         ctx.room.name,
         settings.agent_name,
-        knowledge_base.count(),
+        retrieval_service.count(),
+    )
+    active_sessions = metrics.increment_active_sessions()
+    logger.info(
+        "Active session started room_name=%s active_sessions=%s",
+        ctx.room.name,
+        active_sessions,
     )
     if settings.voice_runtime_mode == "gemini_live":
         session = AgentSession(
@@ -296,7 +321,7 @@ async def handle_session(ctx: JobContext) -> None:
 
     await session.start(
         room=ctx.room,
-        agent=SupportAgent(knowledge_base, metrics=metrics),
+        agent=SupportAgent(retrieval_service, metrics=metrics),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: (
@@ -322,16 +347,30 @@ async def handle_session(ctx: JobContext) -> None:
         )
 
 
+async def handle_session_end(ctx: JobContext) -> None:
+    metrics = get_runtime_metrics()
+    active_sessions = metrics.decrement_active_sessions()
+    logger.info(
+        "Active session ended room_name=%s active_sessions=%s",
+        ctx.room.name,
+        active_sessions,
+    )
+
+
 def create_runtime(
     settings: AppSettings | None = None,
     knowledge_base: KnowledgeBase | None = None,
 ) -> WorkerRuntime:
-    global _RUNTIME_SETTINGS, _RUNTIME_KB, _RUNTIME_METRICS
+    global _RUNTIME_SETTINGS, _RUNTIME_KB, _RUNTIME_RETRIEVAL, _RUNTIME_METRICS
     resolved_settings = settings or load_settings()
     _RUNTIME_SETTINGS = resolved_settings
     _RUNTIME_KB = knowledge_base
+    _RUNTIME_RETRIEVAL = None
     _RUNTIME_METRICS = VoiceAgentMetrics(
-        turn_metrics_log=TurnMetricsLog(Path(resolved_settings.turn_metrics_path))
+        turn_metrics_log=TurnMetricsLog(Path(resolved_settings.turn_metrics_path)),
+        active_sessions_store=ActiveSessionsStore(
+            Path(resolved_settings.active_sessions_path)
+        ),
     )
 
     server_kwargs: dict[str, object] = {
@@ -351,7 +390,10 @@ def create_runtime(
 
     server.setup_fnc = prewarm
     server.load_fnc = worker_load
-    server.rtc_session(agent_name=resolved_settings.agent_name)(handle_session)
+    server.rtc_session(
+        agent_name=resolved_settings.agent_name,
+        on_session_end=handle_session_end,
+    )(handle_session)
 
     return WorkerRuntime(server=server, agent_name=resolved_settings.agent_name)
 

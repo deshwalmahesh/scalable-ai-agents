@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+import threading
 import time
 from typing import Iterable
 
@@ -87,6 +88,44 @@ class TurnMetricsLog:
         return records
 
 
+class ActiveSessionsStore:
+    """Small shared file-backed counter for worker/API active session visibility."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        if not self._path.exists():
+            self.write(0)
+
+    def read(self) -> int:
+        if not self._path.exists():
+            return 0
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        return max(0, int(payload.get("active_sessions", 0)))
+
+    def write(self, value: int) -> int:
+        normalized = max(0, int(value))
+        temp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
+        temp_path.write_text(
+            json.dumps({"active_sessions": normalized}),
+            encoding="utf-8",
+        )
+        temp_path.replace(self._path)
+        return normalized
+
+    def increment(self) -> int:
+        with self._lock:
+            return self.write(self.read() + 1)
+
+    def decrement(self) -> int:
+        with self._lock:
+            return self.write(max(0, self.read() - 1))
+
+
 @dataclass(slots=True)
 class PartialTurnMetrics:
     end_of_utterance_delay_ms: float | None = None
@@ -117,9 +156,15 @@ class VoiceAgentMetrics:
         self,
         registry: CollectorRegistry | None = None,
         turn_metrics_log: TurnMetricsLog | None = None,
+        active_sessions_store: ActiveSessionsStore | None = None,
     ) -> None:
         self.registry = registry or CollectorRegistry()
         self.turn_metrics_log = turn_metrics_log
+        self.active_sessions_store = active_sessions_store
+        self._active_session_count = (
+            active_sessions_store.read() if active_sessions_store is not None else 0
+        )
+        self._active_session_lock = threading.Lock()
         self.call_setup_failures = Counter(
             "voice_agent_call_setup_failures_total",
             "Number of failed call setup attempts.",
@@ -281,7 +326,31 @@ class VoiceAgentMetrics:
         self.call_setup_failures.inc()
 
     def set_active_sessions(self, value: int) -> None:
-        self.active_sessions.set(value)
+        with self._active_session_lock:
+            self._active_session_count = max(0, value)
+            if self.active_sessions_store is not None:
+                self._active_session_count = self.active_sessions_store.write(
+                    self._active_session_count
+                )
+            self.active_sessions.set(self._active_session_count)
+
+    def increment_active_sessions(self) -> int:
+        with self._active_session_lock:
+            if self.active_sessions_store is not None:
+                self._active_session_count = self.active_sessions_store.increment()
+            else:
+                self._active_session_count += 1
+            self.active_sessions.set(self._active_session_count)
+            return self._active_session_count
+
+    def decrement_active_sessions(self) -> int:
+        with self._active_session_lock:
+            if self.active_sessions_store is not None:
+                self._active_session_count = self.active_sessions_store.decrement()
+            else:
+                self._active_session_count = max(0, self._active_session_count - 1)
+            self.active_sessions.set(self._active_session_count)
+            return self._active_session_count
 
     def record_network_quality(self, snapshot: NetworkQualitySnapshot) -> float | None:
         if snapshot.jitter_ms is not None:
@@ -302,6 +371,8 @@ class VoiceAgentMetrics:
         return generate_latest(self.registry)
 
     def sync_summary_metrics(self) -> None:
+        if self.active_sessions_store is not None:
+            self.active_sessions.set(self.active_sessions_store.read())
         if self.turn_metrics_log is None:
             return
 

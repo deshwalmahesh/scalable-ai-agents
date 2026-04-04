@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from voice_agent.kb import KnowledgeBase, KnowledgeDocument
+from voice_agent.kb import KnowledgeBase, KnowledgeDocument, RetrievalService
 
 
 TEST_DOCUMENTS = [
@@ -98,3 +98,17 @@ def test_search_with_trace_reports_timing_metadata(tmp_path: Path) -> None:
     assert results
     assert trace.mode in {"lexical", "hybrid"}
     assert trace.total_ms >= 0.0
+
+
+async def test_retrieval_service_returns_grounding_message(tmp_path: Path) -> None:
+    kb = build_kb(tmp_path)
+    retrieval = RetrievalService(kb)
+
+    result = await retrieval.async_ground(
+        "If I return the policy within ten days, do I get my premium back?",
+        limit=1,
+    )
+
+    assert result.matches
+    assert "Grounding for this turn only" in result.grounding_message
+    assert result.trace.total_ms >= 0.0

@@ -44,6 +44,39 @@ STOPWORDS = {
     "you",
     "your",
 }
+NON_POLICY_PHRASES = {
+    "bye",
+    "can you hear",
+    "can you hear me",
+    "good afternoon",
+    "good evening",
+    "good morning",
+    "goodbye",
+    "hello",
+    "hey",
+    "hi",
+    "how are you",
+    "ok",
+    "okay",
+    "sounds good",
+    "thank you",
+    "thanks",
+    "yes",
+}
+NON_POLICY_TOKENS = {
+    "bye",
+    "good",
+    "hear",
+    "hello",
+    "hey",
+    "hi",
+    "how",
+    "ok",
+    "okay",
+    "thanks",
+    "there",
+    "you",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +99,14 @@ class SearchTrace:
     document_load_ms: float
     rerank_ms: float
     total_ms: float
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedRetrieval:
+    query: str
+    matches: list[KnowledgeMatch]
+    trace: SearchTrace
+    grounding_message: str
 
 
 class KnowledgeBase:
@@ -397,6 +438,100 @@ class KnowledgeBase:
                 self._collection_name,
                 query_text,
             )
+
+
+class RetrievalService:
+    """Single retrieval boundary for grounded policy context."""
+
+    @classmethod
+    def from_settings(cls, settings: AppSettings) -> "RetrievalService":
+        return cls(KnowledgeBase.from_settings(settings))
+
+    def __init__(self, knowledge_base: KnowledgeBase) -> None:
+        self._knowledge_base = knowledge_base
+
+    def count(self) -> int:
+        return self._knowledge_base.count()
+
+    def should_ground(self, query: str) -> bool:
+        normalized_query = " ".join(tokenize(query))
+        if not normalized_query:
+            return False
+        if normalized_query in NON_POLICY_PHRASES:
+            return False
+        tokens = normalized_query.split()
+        return not (
+            len(tokens) <= 4
+            and tokens
+            and all(token in NON_POLICY_TOKENS for token in tokens)
+        )
+
+    async def async_ground(
+        self,
+        query: str,
+        limit: int = 1,
+    ) -> GroundedRetrieval:
+        return await asyncio.to_thread(self.ground, query, limit)
+
+    def ground(self, query: str, limit: int = 1) -> GroundedRetrieval:
+        normalized_query = query.strip()
+        if not self.should_ground(normalized_query):
+            return GroundedRetrieval(
+                query=normalized_query,
+                matches=[],
+                trace=SearchTrace(
+                    mode="skipped",
+                    embedding_ms=0.0,
+                    vector_query_ms=0.0,
+                    document_load_ms=0.0,
+                    rerank_ms=0.0,
+                    total_ms=0.0,
+                ),
+                grounding_message=(
+                    "This user turn is conversational small talk or a connection check. "
+                    "Answer briefly and naturally without citing policy facts."
+                ),
+            )
+        matches, trace = self._knowledge_base.search_with_trace(normalized_query, limit)
+        return GroundedRetrieval(
+            query=normalized_query,
+            matches=matches,
+            trace=trace,
+            grounding_message=build_grounding_message(
+                query=normalized_query,
+                matches=matches,
+            ),
+        )
+
+
+def build_grounding_message(
+    *,
+    query: str,
+    matches: list[KnowledgeMatch],
+) -> str:
+    if not matches:
+        return (
+            "No grounded policy excerpts matched this user turn. "
+            "If the user is asking for policy facts or policy terms, say: "
+            "'I can't answer that from this policy document. Please speak with a human insurance representative.' "
+            "If the user is greeting you or making small talk, answer briefly and naturally."
+        )
+
+    excerpts: list[str] = []
+    for index, match in enumerate(matches, start=1):
+        source_url = match.metadata.get("source_url", "")
+        excerpts.append(
+            f"[Excerpt {index}] Title: {match.title}\n"
+            f"Content: {match.content}\n"
+            f"Source: {source_url}"
+        )
+
+    return (
+        "Grounding for this turn only. Answer using only the policy facts below. "
+        "Do not mention tools, retrieval, or internal process. "
+        "If these excerpts do not fully answer the question, say so briefly instead of guessing.\n\n"
+        f"User question: {query}\n\n" + "\n\n".join(excerpts)
+    )
 
 
 def should_use_cloud_client(

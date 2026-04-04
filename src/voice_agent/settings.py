@@ -30,6 +30,15 @@ class AppSettings(BaseSettings):
     twilio_auth_token: str = Field(..., alias="TWILIO_AUTH_TOKEN")
     twilio_phone_number: str | None = Field(default=None, alias="TWILIO_PHONE_NUMBER")
     twilio_sip_domain: str | None = Field(default=None, alias="TWILIO_SIP_DOMAIN")
+    sip_inbound_trunk_name: str = Field(
+        default="policy-support-inbound",
+        alias="SIP_INBOUND_TRUNK_NAME",
+    )
+    sip_dispatch_rule_name: str = Field(
+        default="policy-support-dispatch",
+        alias="SIP_DISPATCH_RULE_NAME",
+    )
+    sip_room_prefix: str = Field(default="call-", alias="SIP_ROOM_PREFIX")
     deepgram_api_key: str = Field(..., alias="DEEPGRAM_API_KEY")
     cartesia_api_key: str | None = Field(default=None, alias="CARTESIA_API_KEY")
     tts_provider: str = Field(default="deepgram", alias="TTS_PROVIDER")
@@ -63,6 +72,10 @@ class AppSettings(BaseSettings):
     turn_metrics_path: Path = Field(
         default=Path("./data/turn_metrics.jsonl"),
         alias="TURN_METRICS_PATH",
+    )
+    active_sessions_path: Path = Field(
+        default=Path("./data/active_sessions.json"),
+        alias="ACTIVE_SESSIONS_PATH",
     )
     kb_collection_name: str = Field(
         default="test-collection",

@@ -6,8 +6,14 @@ from fastapi.testclient import TestClient
 
 from voice_agent.api import create_app
 from voice_agent.kb import KnowledgeBase, KnowledgeDocument
-from voice_agent.observability import VoiceAgentMetrics
+from voice_agent.observability import ActiveSessionsStore, VoiceAgentMetrics
 from voice_agent.settings import AppSettings
+from voice_agent.telephony import (
+    SIPDispatchRuleSummary,
+    SIPInboundTrunkSummary,
+    SIPProvisionResult,
+    SIPTelephonyStatus,
+)
 
 
 TEST_DOCUMENTS = [
@@ -62,6 +68,31 @@ def create_test_client(settings: AppSettings) -> TestClient:
     return TestClient(app)
 
 
+class FakeTelephonyManager:
+    def __init__(
+        self,
+        *,
+        status_payload: SIPTelephonyStatus | None = None,
+        provisioned_payload: SIPProvisionResult | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._status_payload = status_payload
+        self._provisioned_payload = provisioned_payload
+        self._error = error
+
+    async def fetch_status(self) -> SIPTelephonyStatus:
+        if self._status_payload is None:
+            raise AssertionError("status payload was not configured")
+        return self._status_payload
+
+    async def provision(self) -> SIPProvisionResult:
+        if self._error is not None:
+            raise self._error
+        if self._provisioned_payload is None:
+            raise AssertionError("provision payload was not configured")
+        return self._provisioned_payload
+
+
 def test_healthz_returns_ok(tmp_path: Path) -> None:
     settings = build_settings(tmp_path)
 
@@ -73,7 +104,11 @@ def test_healthz_returns_ok(tmp_path: Path) -> None:
 
 
 def test_readyz_is_degraded_when_telephony_config_is_missing(tmp_path: Path) -> None:
-    settings = build_settings(tmp_path)
+    settings = build_settings(
+        tmp_path,
+        TWILIO_PHONE_NUMBER=None,
+        TWILIO_SIP_DOMAIN=None,
+    )
 
     with create_test_client(settings) as client:
         response = client.get("/readyz")
@@ -113,6 +148,25 @@ def test_metrics_endpoint_exposes_prometheus_text(tmp_path: Path) -> None:
     assert "voice_agent_active_sessions" in response.text
 
 
+def test_metrics_endpoint_reads_shared_active_session_count(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    store = ActiveSessionsStore(Path(settings.active_sessions_path))
+    store.write(2)
+    kb = KnowledgeBase(Path(settings.chroma_persist_dir), settings.kb_collection_name)
+    kb.upsert_documents(TEST_DOCUMENTS)
+    app = create_app(
+        settings=settings,
+        metrics=VoiceAgentMetrics(active_sessions_store=store),
+        knowledge_base=kb,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "voice_agent_active_sessions 2.0" in response.text
+
+
 def test_kb_search_returns_ranked_matches(tmp_path: Path) -> None:
     settings = build_settings(tmp_path)
 
@@ -130,3 +184,107 @@ def test_kb_search_returns_ranked_matches(tmp_path: Path) -> None:
         "refund" in match["title"].lower() or "ten day" in match["title"].lower()
         for match in body["matches"]
     )
+
+
+def test_telephony_status_reports_current_sip_resources(tmp_path: Path) -> None:
+    settings = build_settings(
+        tmp_path,
+        TWILIO_PHONE_NUMBER="+15555550100",
+        TWILIO_SIP_DOMAIN="voice.example.twilio.com",
+    )
+    kb = KnowledgeBase(Path(settings.chroma_persist_dir), settings.kb_collection_name)
+    kb.upsert_documents(TEST_DOCUMENTS)
+    app = create_app(
+        settings=settings,
+        metrics=VoiceAgentMetrics(),
+        knowledge_base=kb,
+        telephony_manager=FakeTelephonyManager(
+            status_payload=SIPTelephonyStatus(
+                phone_number=settings.twilio_phone_number,
+                sip_domain=settings.twilio_sip_domain,
+                inbound_trunk=SIPInboundTrunkSummary(
+                    trunk_id="TRUNK123",
+                    name="policy-support-inbound",
+                    numbers=["+15555550100"],
+                ),
+                dispatch_rule=SIPDispatchRuleSummary(
+                    rule_id="RULE123",
+                    name="policy-support-dispatch",
+                    trunk_ids=["TRUNK123"],
+                    room_prefix="call-",
+                    agent_names=["policy-support-agent"],
+                ),
+            )
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/telephony/sip/status")
+
+    assert response.status_code == 200
+    assert response.json()["inbound_trunk"]["trunk_id"] == "TRUNK123"
+    assert response.json()["dispatch_rule"]["agent_names"] == ["policy-support-agent"]
+
+
+def test_telephony_provision_returns_created_resources(tmp_path: Path) -> None:
+    settings = build_settings(
+        tmp_path,
+        TWILIO_PHONE_NUMBER="+15555550100",
+        TWILIO_SIP_DOMAIN="voice.example.twilio.com",
+    )
+    kb = KnowledgeBase(Path(settings.chroma_persist_dir), settings.kb_collection_name)
+    kb.upsert_documents(TEST_DOCUMENTS)
+    app = create_app(
+        settings=settings,
+        metrics=VoiceAgentMetrics(),
+        knowledge_base=kb,
+        telephony_manager=FakeTelephonyManager(
+            provisioned_payload=SIPProvisionResult(
+                status=SIPTelephonyStatus(
+                    phone_number=settings.twilio_phone_number,
+                    sip_domain=settings.twilio_sip_domain,
+                    inbound_trunk=SIPInboundTrunkSummary(
+                        trunk_id="TRUNK123",
+                        name="policy-support-inbound",
+                        numbers=["+15555550100"],
+                    ),
+                    dispatch_rule=SIPDispatchRuleSummary(
+                        rule_id="RULE123",
+                        name="policy-support-dispatch",
+                        trunk_ids=["TRUNK123"],
+                        room_prefix="call-",
+                        agent_names=["policy-support-agent"],
+                    ),
+                ),
+                created_inbound_trunk=True,
+                created_dispatch_rule=True,
+            )
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/telephony/sip/provision")
+
+    assert response.status_code == 200
+    assert response.json()["created_inbound_trunk"] is True
+    assert response.json()["created_dispatch_rule"] is True
+
+
+def test_telephony_provision_returns_bad_request_for_missing_number(tmp_path: Path) -> None:
+    settings = build_settings(tmp_path)
+    kb = KnowledgeBase(Path(settings.chroma_persist_dir), settings.kb_collection_name)
+    kb.upsert_documents(TEST_DOCUMENTS)
+    app = create_app(
+        settings=settings,
+        metrics=VoiceAgentMetrics(),
+        knowledge_base=kb,
+        telephony_manager=FakeTelephonyManager(
+            error=ValueError("TWILIO_PHONE_NUMBER is required to provision SIP resources")
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/telephony/sip/provision")
+
+    assert response.status_code == 400
+    assert "TWILIO_PHONE_NUMBER" in response.json()["detail"]

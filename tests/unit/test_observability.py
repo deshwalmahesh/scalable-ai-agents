@@ -6,6 +6,7 @@ from livekit.agents.metrics import EOUMetrics, LLMMetrics, TTSMetrics
 from prometheus_client import CollectorRegistry
 
 from voice_agent.observability import (
+    ActiveSessionsStore,
     LiveKitTurnMetricsCollector,
     NetworkQualitySnapshot,
     RetrievalLatencySnapshot,
@@ -101,6 +102,23 @@ def test_turn_metrics_log_summary_is_exposed_in_metrics(tmp_path: Path) -> None:
 
     assert "voice_agent_turn_latency_avg_ms" in rendered
     assert "voice_agent_turn_latency_p95_ms" in rendered
+
+
+def test_active_sessions_store_is_shared_via_metrics_render(tmp_path: Path) -> None:
+    store = ActiveSessionsStore(tmp_path / "active_sessions.json")
+    metrics = VoiceAgentMetrics(
+        registry=CollectorRegistry(),
+        active_sessions_store=store,
+    )
+
+    assert metrics.increment_active_sessions() == 1
+    assert store.read() == 1
+
+    rendered = metrics.render_latest().decode()
+
+    assert "voice_agent_active_sessions" in rendered
+    assert "voice_agent_active_sessions 1.0" in rendered
+    assert metrics.decrement_active_sessions() == 0
 
 
 def test_livekit_turn_metrics_collector_records_completed_turn(tmp_path: Path) -> None:
