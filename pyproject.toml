@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "voice-agent-assignment"
 version = "0.1.0"
-description = "Production-style voice agent assignment built with LiveKit, FastAPI, and Chroma"
+description = "Production-style voice agent built with LiveKit, FastAPI, and Chroma"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -21,6 +21,7 @@ dependencies = [
   "prometheus-client>=0.21.0,<1.0.0",
   "pydantic-settings>=2.8.0,<3.0.0",
   "python-dotenv>=1.0.0,<2.0.0",
+  "redis>=5.0.0,<6.0.0",
   "sentence-transformers>=5.1.0,<6.0.0",
   "torch>=2.7.0,<3.0.0",
   "peft>=0.17.0,<1.0.0",

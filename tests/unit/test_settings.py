@@ -88,6 +88,15 @@ def test_settings_accept_gemini_openai_compat_fallback() -> None:
     assert settings.openai_base_url == GEMINI_OPENAI_BASE_URL
 
 
+def test_settings_require_complete_fallback_llm_configuration() -> None:
+    with pytest.raises(ValidationError):
+        build_settings(
+            FALLBACK_OPENAI_BASE_URL="https://fallback.example.com/v1",
+            FALLBACK_OPENAI_API_KEY="fallback-key",
+            FALLBACK_OPENAI_MODEL=None,
+        )
+
+
 def test_settings_require_llm_configuration_without_env_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

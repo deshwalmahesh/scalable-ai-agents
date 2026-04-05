@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+import types
 
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, TTSMetrics
+from livekit.rtc import stats as rtc_stats
 from prometheus_client import CollectorRegistry
+import pytest
 
+from voice_agent.livekit_smoke import (
+    _extract_network_quality,
+    _summarize_multi_turn_result,
+)
 from voice_agent.observability import (
     ActiveSessionsStore,
     LiveKitTurnMetricsCollector,
@@ -46,6 +54,56 @@ def test_record_network_quality_updates_estimated_mos() -> None:
     assert "voice_agent_estimated_mos" in rendered
 
 
+def test_extract_network_quality_uses_actual_rtp_stats() -> None:
+    report = rtc_stats.RtcStats()
+    report.inbound_rtp.rtc.id = "inbound-1"
+    report.inbound_rtp.received.jitter = 0.018
+    report.inbound_rtp.received.packets_received = 980
+    report.inbound_rtp.received.packets_lost = 20
+
+    summary = _extract_network_quality([report])
+
+    assert summary["jitter_ms"] == 18.0
+    assert summary["packets_received"] == 980
+    assert summary["packets_lost"] == 20
+    assert summary["packet_loss_fraction"] == 0.02
+    assert summary["estimated_mos"] is not None
+
+
+def test_summarize_multi_turn_result_surfaces_submission_quality_summary() -> None:
+    summary = _summarize_multi_turn_result(
+        [
+            {
+                "round_trip_success": True,
+                "response_latency_ms": 1200.0,
+                "network_quality": {
+                    "jitter_ms": 10.0,
+                    "packet_loss_fraction": 0.01,
+                    "estimated_mos": 4.12,
+                },
+            },
+            {
+                "round_trip_success": False,
+                "response_latency_ms": 1600.0,
+                "network_quality": {
+                    "jitter_ms": 25.0,
+                    "packet_loss_fraction": 0.03,
+                    "estimated_mos": 3.55,
+                },
+            },
+        ]
+    )
+
+    assert summary["turn_count"] == 2
+    assert summary["successful_turns"] == 1
+    assert summary["avg_response_latency_ms"] == 1400.0
+    assert summary["worst_response_latency_ms"] == 1600.0
+    assert summary["worst_jitter_ms"] == 25.0
+    assert summary["worst_packet_loss_fraction"] == 0.03
+    assert summary["lowest_estimated_mos"] == 3.55
+    assert summary["turns_with_network_quality"] == 2
+
+
 def test_record_retrieval_latency_exposes_stage_metrics() -> None:
     metrics = VoiceAgentMetrics(registry=CollectorRegistry())
 
@@ -62,6 +120,24 @@ def test_record_retrieval_latency_exposes_stage_metrics() -> None:
     assert total == 240.0
     rendered = metrics.render_latest().decode()
     assert "voice_agent_retrieval_total_ms" in rendered
+
+
+def test_explicit_failure_metrics_are_exposed() -> None:
+    metrics = VoiceAgentMetrics(registry=CollectorRegistry())
+
+    metrics.record_upstream_failure("retrieval")
+    metrics.record_llm_availability_change(
+        provider="example.com",
+        model="fallback-model",
+        available=False,
+    )
+
+    rendered = metrics.render_latest().decode()
+    assert 'voice_agent_upstream_failures_total{component="retrieval"} 1.0' in rendered
+    assert (
+        'voice_agent_llm_availability_changes_total{model="fallback-model",provider="example.com",state="unavailable"} 1.0'
+        in rendered
+    )
 
 
 def test_average_latency_ms_returns_zero_for_empty_input() -> None:
@@ -119,6 +195,54 @@ def test_active_sessions_store_is_shared_via_metrics_render(tmp_path: Path) -> N
     assert "voice_agent_active_sessions" in rendered
     assert "voice_agent_active_sessions 1.0" in rendered
     assert metrics.decrement_active_sessions() == 0
+
+
+def test_active_sessions_store_supports_redis_backing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeRedisClient:
+        def __init__(self) -> None:
+            self.values: dict[str, int] = {}
+
+        def get(self, key: str) -> str | None:
+            value = self.values.get(key)
+            return None if value is None else str(value)
+
+        def set(self, key: str, value: int) -> None:
+            self.values[key] = int(value)
+
+        def incr(self, key: str) -> int:
+            current = self.values.get(key, 0) + 1
+            self.values[key] = current
+            return current
+
+        def eval(self, script: str, numkeys: int, key: str) -> int:
+            current = max(0, self.values.get(key, 0) - 1)
+            self.values[key] = current
+            return current
+
+    fake_client = FakeRedisClient()
+
+    class FakeRedis:
+        @staticmethod
+        def from_url(url: str, decode_responses: bool = True) -> FakeRedisClient:
+            assert url == "redis://example:6379/0"
+            assert decode_responses is True
+            return fake_client
+
+    monkeypatch.setitem(sys.modules, "redis", types.SimpleNamespace(Redis=FakeRedis))
+
+    store = ActiveSessionsStore(
+        tmp_path / "active_sessions.json",
+        redis_url="redis://example:6379/0",
+        redis_key="voice-agent:test",
+    )
+
+    assert store.uses_local_file is False
+    assert store.read() == 0
+    assert store.increment() == 1
+    assert store.increment() == 2
+    assert store.decrement() == 1
+    assert store.write(7) == 7
+    assert store.read() == 7
 
 
 def test_livekit_turn_metrics_collector_records_completed_turn(tmp_path: Path) -> None:

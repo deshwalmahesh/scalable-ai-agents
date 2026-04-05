@@ -11,6 +11,7 @@ ALLOWED_VOICE_RUNTIME_MODES = {"cascade", "gemini_live"}
 ALLOWED_TTS_PROVIDERS = {"deepgram", "cartesia"}
 ALLOWED_EMBEDDING_PROVIDERS = {"local", "remote"}
 ALLOWED_CHROMA_PROVIDERS = {"local", "remote"}
+ALLOWED_REDIS_SCHEMES = ("redis://", "rediss://")
 
 
 class AppSettings(BaseSettings):
@@ -56,6 +57,18 @@ class AppSettings(BaseSettings):
     openai_base_url: str | None = Field(default=None, alias="OPENAI_BASE_URL")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str | None = Field(default=None, alias="OPENAI_MODEL")
+    fallback_openai_base_url: str | None = Field(
+        default=None,
+        alias="FALLBACK_OPENAI_BASE_URL",
+    )
+    fallback_openai_api_key: str | None = Field(
+        default=None,
+        alias="FALLBACK_OPENAI_API_KEY",
+    )
+    fallback_openai_model: str | None = Field(
+        default=None,
+        alias="FALLBACK_OPENAI_MODEL",
+    )
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_llm_model_name: str | None = Field(
         default=None, alias="GEMINI_LLM_MODEL_NAME"
@@ -76,6 +89,11 @@ class AppSettings(BaseSettings):
     active_sessions_path: Path = Field(
         default=Path("./data/active_sessions.json"),
         alias="ACTIVE_SESSIONS_PATH",
+    )
+    redis_url: str | None = Field(default=None, alias="REDIS_URL")
+    active_sessions_key: str = Field(
+        default="voice-agent:active-sessions",
+        alias="ACTIVE_SESSIONS_KEY",
     )
     kb_collection_name: str = Field(
         default="test-collection",
@@ -103,7 +121,7 @@ class AppSettings(BaseSettings):
     http_timeout_seconds: float = Field(
         default=15.0, alias="HTTP_TIMEOUT_SECONDS", gt=0
     )
-    agent_max_retries: int = Field(default=2, alias="AGENT_MAX_RETRIES", ge=0, le=5)
+    agent_max_retries: int = Field(default=0, alias="AGENT_MAX_RETRIES", ge=0, le=5)
     kb_embedding_weight: float = Field(
         default=0.7,
         alias="KB_EMBEDDING_WEIGHT",
@@ -151,6 +169,15 @@ class AppSettings(BaseSettings):
             return value
         if not value.startswith(("http://", "https://", "ws://", "wss://")):
             raise ValueError("must be an absolute URL")
+        return value.rstrip("/")
+
+    @field_validator("redis_url")
+    @classmethod
+    def validate_redis_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value.startswith(ALLOWED_REDIS_SCHEMES):
+            raise ValueError("REDIS_URL must start with redis:// or rediss://")
         return value.rstrip("/")
 
     @field_validator("log_level")
@@ -227,6 +254,17 @@ class AppSettings(BaseSettings):
         self.openai_model = self.openai_model or self.gemini_llm_model_name
         if not self.openai_base_url and self.gemini_api_key:
             self.openai_base_url = GEMINI_OPENAI_BASE_URL
+
+        fallback_values = (
+            self.fallback_openai_base_url,
+            self.fallback_openai_api_key,
+            self.fallback_openai_model,
+        )
+        if any(value is not None for value in fallback_values) and not all(fallback_values):
+            raise ValueError(
+                "Set FALLBACK_OPENAI_BASE_URL, FALLBACK_OPENAI_API_KEY, and "
+                "FALLBACK_OPENAI_MODEL together to enable LLM failover"
+            )
 
         missing = []
         if not self.openai_base_url:

@@ -11,11 +11,13 @@ from typing import Any
 import aiohttp
 import certifi
 from livekit import api, rtc
+from livekit.rtc import stats as rtc_stats
 from livekit.protocol.agent_dispatch import CreateAgentDispatchRequest
 from livekit.protocol.room import CreateRoomRequest, DeleteRoomRequest
 from livekit.rtc._proto.room_pb2 import TrackPublishOptions
 
 from voice_agent.deepgram_smoke import _normalize_text
+from voice_agent.observability import VoiceAgentMetrics
 from voice_agent.settings import AppSettings, load_settings
 from livekit.plugins import deepgram
 
@@ -42,6 +44,90 @@ def _keyword_hits(text: str, expected_keywords: list[str]) -> list[str]:
 
 def _frame_peak_level(frame: rtc.AudioFrame) -> int:
     return max((abs(sample) for sample in frame.data), default=0)
+
+
+def _extract_network_quality(
+    stats_reports: list[rtc_stats.RtcStats],
+) -> dict[str, float | int | None]:
+    jitter_seconds: list[float] = []
+    packet_loss_fractions: list[float] = []
+    packets_received = 0
+    packets_lost = 0
+
+    for report in stats_reports:
+        if report.HasField("inbound_rtp"):
+            received = report.inbound_rtp.received
+            jitter_seconds.append(max(0.0, float(received.jitter)))
+            packets_received = max(packets_received, int(received.packets_received))
+            packets_lost = max(packets_lost, max(0, int(received.packets_lost)))
+        if report.HasField("remote_inbound_rtp"):
+            packet_loss_fractions.append(
+                max(0.0, float(report.remote_inbound_rtp.remote_inbound.fraction_lost))
+            )
+
+    packet_loss_fraction: float | None = None
+    if packet_loss_fractions:
+        packet_loss_fraction = max(packet_loss_fractions)
+    elif packets_received > 0 or packets_lost > 0:
+        packet_loss_fraction = packets_lost / max(1, packets_received + packets_lost)
+
+    jitter_ms = round(max(jitter_seconds) * 1000, 2) if jitter_seconds else None
+    normalized_packet_loss = (
+        round(packet_loss_fraction, 4) if packet_loss_fraction is not None else None
+    )
+    return {
+        "jitter_ms": jitter_ms,
+        "packet_loss_fraction": normalized_packet_loss,
+        "packets_received": packets_received,
+        "packets_lost": packets_lost,
+        "estimated_mos": VoiceAgentMetrics.estimate_mos(
+            jitter_ms=jitter_ms,
+            packet_loss_fraction=normalized_packet_loss,
+        ),
+    }
+
+
+def _summarize_multi_turn_result(turn_results: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    response_latencies = [
+        float(turn["response_latency_ms"])
+        for turn in turn_results
+        if turn.get("response_latency_ms") is not None
+    ]
+    jitters = [
+        float(turn["network_quality"]["jitter_ms"])
+        for turn in turn_results
+        if turn.get("network_quality", {}).get("jitter_ms") is not None
+    ]
+    packet_losses = [
+        float(turn["network_quality"]["packet_loss_fraction"])
+        for turn in turn_results
+        if turn.get("network_quality", {}).get("packet_loss_fraction") is not None
+    ]
+    mos_scores = [
+        float(turn["network_quality"]["estimated_mos"])
+        for turn in turn_results
+        if turn.get("network_quality", {}).get("estimated_mos") is not None
+    ]
+    measured_turns = sum(
+        1
+        for turn in turn_results
+        if turn.get("network_quality", {}).get("jitter_ms") is not None
+        or turn.get("network_quality", {}).get("packet_loss_fraction") is not None
+    )
+    return {
+        "turn_count": len(turn_results),
+        "successful_turns": sum(1 for turn in turn_results if turn.get("round_trip_success")),
+        "avg_response_latency_ms": (
+            round(sum(response_latencies) / len(response_latencies), 2)
+            if response_latencies
+            else None
+        ),
+        "worst_response_latency_ms": round(max(response_latencies), 2) if response_latencies else None,
+        "worst_jitter_ms": round(max(jitters), 2) if jitters else None,
+        "worst_packet_loss_fraction": round(max(packet_losses), 4) if packet_losses else None,
+        "lowest_estimated_mos": round(min(mos_scores), 2) if mos_scores else None,
+        "turns_with_network_quality": measured_turns,
+    }
 
 
 async def _wait_for_agent_participant(room: rtc.Room, timeout_seconds: float) -> rtc.RemoteParticipant:
@@ -195,10 +281,119 @@ async def _collect_stream_utterance(
     return result
 
 
+async def _drain_initial_greeting(
+    agent_participant: rtc.RemoteParticipant,
+) -> None:
+    greeting_track = await _wait_for_agent_audio_track(
+        agent_participant,
+        timeout_seconds=3,
+    )
+    if greeting_track is None:
+        return
+
+    stream = rtc.AudioStream.from_track(
+        track=greeting_track,
+        sample_rate=24000,
+        num_channels=1,
+        frame_size_ms=20,
+    )
+    try:
+        await _collect_stream_utterance(
+            stream,
+            hard_timeout_seconds=12,
+            silence_timeout_seconds=1.2,
+        )
+    finally:
+        await stream.aclose()
+    await asyncio.sleep(0.75)
+
+
+async def _run_question_turn(
+    *,
+    room: rtc.Room,
+    agent_participant: rtc.RemoteParticipant,
+    tts: deepgram.TTS,
+    stt: deepgram.STT,
+    question_text: str,
+    expected_keywords: list[str],
+    forbidden_keywords: list[str] | None = None,
+) -> dict[str, Any]:
+    question_started_at = time.perf_counter()
+    published_audio = await _publish_question_audio(room, tts, question_text)
+    response_track = await _wait_for_agent_audio_track(
+        agent_participant,
+        timeout_seconds=15,
+    )
+    if response_track is None:
+        raise RuntimeError("No agent audio track was published after the client question")
+
+    stream = rtc.AudioStream.from_track(
+        track=response_track,
+        sample_rate=24000,
+        num_channels=1,
+        frame_size_ms=20,
+    )
+    try:
+        response_audio = await _collect_stream_utterance(
+            stream,
+            hard_timeout_seconds=30,
+            silence_timeout_seconds=2.2,
+        )
+    finally:
+        await stream.aclose()
+
+    response_frames = response_audio["frames"]
+    first_response_frame_at = response_audio["first_non_silent_at"]
+    network_quality = _extract_network_quality(await response_track.get_stats())
+    logger.info(
+        "Received agent response audio question_text=%s response_frame_count=%s published_audio=%s",
+        question_text,
+        len(response_frames),
+        published_audio,
+    )
+    if not response_frames:
+        raise RuntimeError("No agent audio was received after publishing the client question")
+
+    transcription = await stt.recognize(response_frames, language="en-US")
+    response_text = transcription.alternatives[0].text if transcription.alternatives else ""
+    response_keyword_hits = _keyword_hits(response_text, expected_keywords)
+    forbidden_keyword_hits = _keyword_hits(response_text, forbidden_keywords or [])
+    logger.info(
+        "Transcribed agent response question_text=%s response_text=%s keyword_hits=%s forbidden_keyword_hits=%s",
+        question_text,
+        response_text,
+        response_keyword_hits,
+        forbidden_keyword_hits,
+    )
+    return {
+        "question_text": question_text,
+        "published_audio": published_audio,
+        "agent_response_frames": len(response_frames),
+        "agent_response_audio_duration_ms": round(
+            sum(frame.duration for frame in response_frames) * 1000,
+            2,
+        ),
+        "response_text": response_text,
+        "response_keyword_hits": response_keyword_hits,
+        "forbidden_keyword_hits": forbidden_keyword_hits,
+        "response_latency_ms": (
+            round((first_response_frame_at - question_started_at) * 1000, 2)
+            if first_response_frame_at is not None
+            else None
+        ),
+        "network_quality": network_quality,
+        "round_trip_success": (
+            len(response_keyword_hits) >= max(1, len(expected_keywords) // 2)
+            and not forbidden_keyword_hits
+        ),
+    }
+
+
 async def run_smoke(
     question_text: str = "If I return the policy within ten days, do I get my premium back?",
     room_name_prefix: str = "voice-agent-conversation",
     expected_keywords: list[str] | None = None,
+    forbidden_keywords: list[str] | None = None,
 ) -> dict[str, Any]:
     settings = load_settings()
     keywords = expected_keywords or ["10", "ten", "premium", "refund"]
@@ -253,12 +448,7 @@ async def run_smoke(
     response_text = ""
     response_keyword_hits: list[str] = []
     agent_participant: rtc.RemoteParticipant | None = None
-    question_started_at = 0.0
-    first_response_frame_at: float | None = None
     published_audio: dict[str, Any] = {}
-    response_frames: list[rtc.AudioFrame] = []
-    stream: rtc.AudioStream | None = None
-
     try:
         await lkapi.room.create_room(CreateRoomRequest(name=room_name))
         logger.info("Created LiveKit room room_name=%s", room_name)
@@ -314,77 +504,27 @@ async def run_smoke(
             agent_participant,
             timeout_seconds=3,
         )
-        if greeting_track is not None:
-            stream = rtc.AudioStream.from_track(
-                track=greeting_track,
-                sample_rate=24000,
-                num_channels=1,
-                frame_size_ms=20,
-            )
-            greeting = await _collect_stream_utterance(
-                stream,
-                hard_timeout_seconds=12,
-                silence_timeout_seconds=1.2,
-            )
-            logger.info(
-                "Initial greeting probe room_name=%s frame_count=%s",
-                room_name,
-                len(greeting["frames"]),
-            )
-            await stream.aclose()
-            stream = None
-            await asyncio.sleep(0.75)
-        else:
+        if greeting_track is None:
             logger.info("No initial agent audio track yet room_name=%s", room_name)
+        else:
+            await _drain_initial_greeting(agent_participant)
+            logger.info("Initial greeting probe completed room_name=%s", room_name)
 
-        question_started_at = time.perf_counter()
-        published_audio = await _publish_question_audio(room, tts, question_text)
-        response_track = await _wait_for_agent_audio_track(
-            agent_participant,
-            timeout_seconds=15,
+        turn_result = await _run_question_turn(
+            room=room,
+            agent_participant=agent_participant,
+            tts=tts,
+            stt=stt,
+            question_text=question_text,
+            expected_keywords=keywords,
+            forbidden_keywords=forbidden_keywords,
         )
-        if response_track is None:
-            raise RuntimeError("No agent audio track was published after the client question")
-        stream = rtc.AudioStream.from_track(
-            track=response_track,
-            sample_rate=24000,
-            num_channels=1,
-            frame_size_ms=20,
-        )
-        collect_task = asyncio.create_task(
-            _collect_stream_utterance(
-                stream,
-                hard_timeout_seconds=30,
-                silence_timeout_seconds=2.2,
-            )
-        )
-        response_audio = await collect_task
-        response_frames = response_audio["frames"]
-        first_response_frame_at = response_audio["first_non_silent_at"]
-        logger.info(
-            "Received agent response audio room_name=%s response_frame_count=%s published_audio=%s",
-            room_name,
-            len(response_frames),
-            published_audio,
-        )
-
-        if not response_frames:
-            raise RuntimeError("No agent audio was received after publishing the client question")
-
-        transcription = await stt.recognize(response_frames, language="en-US")
-        response_text = transcription.alternatives[0].text if transcription.alternatives else ""
-        response_keyword_hits = _keyword_hits(response_text, keywords)
-        logger.info(
-            "Transcribed agent response room_name=%s response_text=%s keyword_hits=%s",
-            room_name,
-            response_text,
-            response_keyword_hits,
-        )
+        published_audio = turn_result["published_audio"]
+        response_text = str(turn_result["response_text"])
+        response_keyword_hits = list(turn_result["response_keyword_hits"])
     finally:
         await stt.aclose()
         await tts.aclose()
-        if stream is not None:
-            await stream.aclose()
         if room.isconnected():
             await room.disconnect()
         with contextlib.suppress(Exception):
@@ -392,30 +532,110 @@ async def run_smoke(
         await lkapi.aclose()
         await http_session.close()
 
-    response_audio_duration_ms = round(
-        sum(frame.duration for frame in response_frames) * 1000,
-        2,
-    )
     return {
         "room_name": room_name,
         "agent_identity": agent_participant.identity if agent_participant else "",
         "dispatch_created": True,
         "question_text": question_text,
         "published_audio": published_audio,
-        "agent_response_frames": len(response_frames),
-        "agent_response_audio_duration_ms": response_audio_duration_ms,
+        "agent_response_frames": turn_result["agent_response_frames"],
+        "agent_response_audio_duration_ms": turn_result["agent_response_audio_duration_ms"],
         "response_text": response_text,
         "response_keyword_hits": response_keyword_hits,
-        "response_latency_ms": (
-            round((first_response_frame_at - question_started_at) * 1000, 2)
-            if question_started_at and first_response_frame_at is not None
-            else None
-        ),
-        "round_trip_success": len(response_keyword_hits) >= max(1, len(keywords) // 2),
+        "forbidden_keyword_hits": turn_result["forbidden_keyword_hits"],
+        "response_latency_ms": turn_result["response_latency_ms"],
+        "network_quality": turn_result["network_quality"],
+        "round_trip_success": turn_result["round_trip_success"],
         "tts_metrics": tts_metrics,
         "stt_metrics": stt_metrics,
         "llm_model": settings.openai_model,
         "llm_base_url": settings.openai_base_url,
+    }
+
+
+async def run_multi_turn_smoke(
+    turns: list[dict[str, Any]],
+    room_name_prefix: str = "voice-agent-conversation",
+) -> dict[str, Any]:
+    settings = load_settings()
+    logger.info("Starting LiveKit multi-turn smoke run turn_count=%s", len(turns))
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    http_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx))
+    room_name = f"{room_name_prefix}-{time.time_ns()}"
+    room = rtc.Room()
+    lkapi = api.LiveKitAPI(
+        url=settings.livekit_url,
+        api_key=settings.livekit_api_key,
+        api_secret=settings.livekit_api_secret,
+        session=http_session,
+    )
+    tts = deepgram.TTS(
+        model="aura-2-asteria-en",
+        api_key=settings.deepgram_api_key,
+        http_session=http_session,
+    )
+    stt = deepgram.STT(
+        model="nova-3",
+        language="en-US",
+        api_key=settings.deepgram_api_key,
+        http_session=http_session,
+    )
+    agent_participant: rtc.RemoteParticipant | None = None
+    turn_results: list[dict[str, Any]] = []
+
+    try:
+        await lkapi.room.create_room(CreateRoomRequest(name=room_name))
+        client_token = _build_room_token(
+            settings=settings,
+            room_name=room_name,
+            identity="smoke-client",
+            name="smoke-client",
+        )
+        await room.connect(settings.livekit_url, client_token)
+        await lkapi.agent_dispatch.create_dispatch(
+            CreateAgentDispatchRequest(
+                agent_name=settings.agent_name,
+                room=room_name,
+            )
+        )
+        agent_participant = await _wait_for_agent_participant(room, timeout_seconds=30)
+
+        greeting_track = await _wait_for_agent_audio_track(
+            agent_participant,
+            timeout_seconds=3,
+        )
+        if greeting_track is not None:
+            await _drain_initial_greeting(agent_participant)
+
+        for index, turn in enumerate(turns, start=1):
+            turn_result = await _run_question_turn(
+                room=room,
+                agent_participant=agent_participant,
+                tts=tts,
+                stt=stt,
+                question_text=str(turn["question_text"]),
+                expected_keywords=list(turn.get("expected_keywords", [])),
+                forbidden_keywords=list(turn.get("forbidden_keywords", [])),
+            )
+            turn_result["turn_index"] = index
+            turn_results.append(turn_result)
+            await asyncio.sleep(0.75)
+    finally:
+        await stt.aclose()
+        await tts.aclose()
+        if room.isconnected():
+            await room.disconnect()
+        with contextlib.suppress(Exception):
+            await lkapi.room.delete_room(DeleteRoomRequest(room=room_name))
+        await lkapi.aclose()
+        await http_session.close()
+
+    return {
+        "room_name": room_name,
+        "agent_identity": agent_participant.identity if agent_participant else "",
+        "turns": turn_results,
+        "round_trip_success": all(turn["round_trip_success"] for turn in turn_results),
+        "quality_summary": _summarize_multi_turn_result(turn_results),
     }
 
 

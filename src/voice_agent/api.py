@@ -8,7 +8,11 @@ from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel
 
 from voice_agent.kb import KnowledgeBase, KnowledgeMatch
-from voice_agent.observability import ActiveSessionsStore, TurnMetricsLog, VoiceAgentMetrics
+from voice_agent.observability import (
+    ActiveSessionsStore,
+    TurnMetricsLog,
+    VoiceAgentMetrics,
+)
 from voice_agent.settings import AppSettings, load_settings
 from voice_agent.telephony import (
     LiveKitTelephonyManager,
@@ -94,7 +98,9 @@ def build_state(
     resolved_metrics = metrics or VoiceAgentMetrics(
         turn_metrics_log=TurnMetricsLog(Path(resolved_settings.turn_metrics_path)),
         active_sessions_store=ActiveSessionsStore(
-            Path(resolved_settings.active_sessions_path)
+            Path(resolved_settings.active_sessions_path),
+            redis_url=resolved_settings.redis_url,
+            redis_key=resolved_settings.active_sessions_key,
         ),
     )
     resolved_kb = knowledge_base or KnowledgeBase.from_settings(resolved_settings)

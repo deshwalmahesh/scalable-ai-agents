@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 import json
 import logging
 from pathlib import Path
 import threading
+import tempfile
 import time
 from typing import Iterable
 
@@ -89,16 +91,52 @@ class TurnMetricsLog:
 
 
 class ActiveSessionsStore:
-    """Small shared file-backed counter for worker/API active session visibility."""
+    """Shared active-session counter with a local-file fallback for development."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        redis_url: str | None = None,
+        redis_key: str = "voice-agent:active-sessions",
+    ) -> None:
         self._path = path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._redis_url = redis_url
+        self._redis_key = redis_key
+        self._redis_client: object | None = None
         self._lock = threading.Lock()
-        if not self._path.exists():
+        if self.uses_local_file and not self._path.exists():
             self.write(0)
 
+    @property
+    def uses_local_file(self) -> bool:
+        return self._redis_url is None
+
+    def _get_redis_client(self) -> object:
+        if self._redis_url is None:
+            raise RuntimeError("Redis client requested without a configured REDIS_URL")
+        if self._redis_client is None:
+            try:
+                redis_module = importlib.import_module("redis")
+            except ImportError as exc:
+                raise RuntimeError(
+                    "REDIS_URL is configured but the 'redis' package is not installed"
+                ) from exc
+            self._redis_client = redis_module.Redis.from_url(
+                self._redis_url,
+                decode_responses=True,
+            )
+        return self._redis_client
+
     def read(self) -> int:
+        if self._redis_url is not None:
+            raw_value = self._get_redis_client().get(self._redis_key)
+            if raw_value is None:
+                return 0
+            try:
+                return max(0, int(raw_value))
+            except (TypeError, ValueError):
+                return 0
         if not self._path.exists():
             return 0
         try:
@@ -109,19 +147,51 @@ class ActiveSessionsStore:
 
     def write(self, value: int) -> int:
         normalized = max(0, int(value))
-        temp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
-        temp_path.write_text(
-            json.dumps({"active_sessions": normalized}),
+        if self._redis_url is not None:
+            self._get_redis_client().set(self._redis_key, normalized)
+            return normalized
+        with tempfile.NamedTemporaryFile(
+            "w",
             encoding="utf-8",
-        )
+            dir=self._path.parent,
+            prefix=f"{self._path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(json.dumps({"active_sessions": normalized}))
+            temp_path = Path(handle.name)
         temp_path.replace(self._path)
         return normalized
 
     def increment(self) -> int:
+        if self._redis_url is not None:
+            return int(self._get_redis_client().incr(self._redis_key))
         with self._lock:
             return self.write(self.read() + 1)
 
     def decrement(self) -> int:
+        if self._redis_url is not None:
+            return int(
+                self._get_redis_client().eval(
+                    """
+                    local current = redis.call('GET', KEYS[1])
+                    if not current then
+                      redis.call('SET', KEYS[1], 0)
+                      return 0
+                    end
+                    current = tonumber(current)
+                    if current <= 0 then
+                      redis.call('SET', KEYS[1], 0)
+                      return 0
+                    end
+                    current = current - 1
+                    redis.call('SET', KEYS[1], current)
+                    return current
+                    """,
+                    1,
+                    self._redis_key,
+                )
+            )
         with self._lock:
             return self.write(max(0, self.read() - 1))
 
@@ -174,6 +244,18 @@ class VoiceAgentMetrics:
             "voice_agent_retry_attempts_total",
             "Number of retry attempts across upstream integrations.",
             ["component"],
+            registry=self.registry,
+        )
+        self.upstream_failures = Counter(
+            "voice_agent_upstream_failures_total",
+            "Number of upstream integration failures observed by component.",
+            ["component"],
+            registry=self.registry,
+        )
+        self.llm_availability_changes = Counter(
+            "voice_agent_llm_availability_changes_total",
+            "Number of LLM availability changes observed by explicit failover logic.",
+            ["provider", "model", "state"],
             registry=self.registry,
         )
         self.active_sessions = Gauge(
@@ -322,6 +404,22 @@ class VoiceAgentMetrics:
     def record_retry(self, component: str) -> None:
         self.retry_attempts.labels(component=component).inc()
 
+    def record_upstream_failure(self, component: str) -> None:
+        self.upstream_failures.labels(component=component).inc()
+
+    def record_llm_availability_change(
+        self,
+        *,
+        provider: str,
+        model: str,
+        available: bool,
+    ) -> None:
+        self.llm_availability_changes.labels(
+            provider=provider,
+            model=model,
+            state="available" if available else "unavailable",
+        ).inc()
+
     def record_call_setup_failure(self) -> None:
         self.call_setup_failures.inc()
 
@@ -450,3 +548,4 @@ def percentile(values: list[float], quantile: float) -> float:
     sorted_values = sorted(values)
     index = max(0, int(len(sorted_values) * quantile) - 1)
     return sorted_values[index]
+

@@ -10,10 +10,14 @@ import time
 import chromadb
 
 from voice_agent.data.knowledge_documents import KnowledgeDocument
-from voice_agent.retrieval import embed_texts, warm_local_model
+from voice_agent.retrieval import embed_texts
 from voice_agent.settings import AppSettings
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
+SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?;:])\s+|\s+(?=\d+\.)")
+LEAD_IN_FRAGMENT_PATTERN = re.compile(r"(:|\b\d+\.)$")
+LIST_MARKER_PATTERN = re.compile(r"^\d+\.$")
+PREFERRED_SNIPPET_STARTERS = ("If ", "We ", "You ", "There ", "The ", "A ")
 STOPWORDS = {
     "a",
     "an",
@@ -77,6 +81,9 @@ NON_POLICY_TOKENS = {
     "there",
     "you",
 }
+UNSUPPORTED_POLICY_RESPONSE = (
+    "I can't answer that from this policy document. Please speak with a human insurance representative."
+)
 logger = logging.getLogger(__name__)
 
 
@@ -163,8 +170,6 @@ class KnowledgeBase:
             if chroma_provider is not None
             else should_use_cloud_client(chroma_api_key, chroma_tenant, chroma_database)
         )
-        if self._embedding_provider == "local":
-            warm_local_model()
         if use_cloud_client:
             self._client = chromadb.CloudClient(
                 api_key=chroma_api_key,
@@ -513,25 +518,83 @@ def build_grounding_message(
         return (
             "No grounded policy excerpts matched this user turn. "
             "If the user is asking for policy facts or policy terms, say: "
-            "'I can't answer that from this policy document. Please speak with a human insurance representative.' "
+            f"'{UNSUPPORTED_POLICY_RESPONSE}' "
             "If the user is greeting you or making small talk, answer briefly and naturally."
         )
 
     excerpts: list[str] = []
     for index, match in enumerate(matches, start=1):
         source_url = match.metadata.get("source_url", "")
+        snippet = select_grounding_snippet(query, match.content)
         excerpts.append(
             f"[Excerpt {index}] Title: {match.title}\n"
-            f"Content: {match.content}\n"
+            f"Content: {snippet}\n"
             f"Source: {source_url}"
         )
 
     return (
         "Grounding for this turn only. Answer using only the policy facts below. "
         "Do not mention tools, retrieval, or internal process. "
-        "If these excerpts do not fully answer the question, say so briefly instead of guessing.\n\n"
+        "If the excerpts support the user's question, answer directly and briefly. "
+        "When the excerpts give an exact number, date, or time window, repeat that exact value and do not broaden it into a range or a typical industry practice. "
+        "If they support only part of the question, answer the supported part and briefly say what remains unclear instead of refusing. "
+        "If an excerpt gives one concrete condition under which a claim or benefit is not paid, state that condition directly even if the user asked more broadly. "
+        "Only refuse when the excerpts do not support the answer at all.\n\n"
         f"User question: {query}\n\n" + "\n\n".join(excerpts)
     )
+
+
+def select_grounding_snippet(query: str, content: str) -> str:
+    raw_sentences = [sentence.strip() for sentence in SENTENCE_SPLIT_PATTERN.split(content) if sentence.strip()]
+    sentences: list[str] = []
+    index = 0
+    while index < len(raw_sentences):
+        sentence = raw_sentences[index]
+        if LIST_MARKER_PATTERN.fullmatch(sentence) and index + 1 < len(raw_sentences):
+            sentences.append(f"{sentence} {raw_sentences[index + 1]}")
+            index += 2
+            continue
+        sentences.append(sentence)
+        index += 1
+
+    if len(sentences) <= 1:
+        return content.strip()
+    if not significant_tokens(query):
+        return sentences[0]
+
+    scored_sentences: list[tuple[int, float]] = []
+    for index, sentence in enumerate(sentences):
+        score = lexical_coverage_score_from_tokens(query, set(tokenize(sentence)))
+        if any(token.isdigit() for token in tokenize(sentence)):
+            score += 0.1
+        scored_sentences.append((index, score))
+
+    best_index, best_score = max(scored_sentences, key=lambda item: item[1])
+    if best_score <= 0:
+        return sentences[0]
+    snippet = sentences[best_index]
+    if best_index + 1 < len(sentences) and LEAD_IN_FRAGMENT_PATTERN.search(snippet):
+        snippet = f"{snippet} {sentences[best_index + 1]}"
+    return clean_grounding_snippet_text(snippet)
+
+
+def clean_grounding_snippet_text(snippet: str) -> str:
+    text = " ".join(snippet.split()).strip()
+    if not text:
+        return ""
+
+    for starter in PREFERRED_SNIPPET_STARTERS:
+        if text.startswith(starter):
+            return text
+
+    candidate_positions = [
+        text.find(f" {starter}")
+        for starter in PREFERRED_SNIPPET_STARTERS
+    ]
+    candidate_positions = [position for position in candidate_positions if position > 0]
+    if not candidate_positions:
+        return text
+    return text[min(candidate_positions) + 1 :]
 
 
 def should_use_cloud_client(
