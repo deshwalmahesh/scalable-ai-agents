@@ -18,6 +18,10 @@ It answers policy questions on a live call by:
 4. generating a reply or using a direct grounded answer
 5. turning the reply back into audio
 
+## System Flow Design
+<img width="5481" height="5612" alt="system_flow_diagram" src="https://github.com/user-attachments/assets/e8455307-6379-451d-baa9-2939ec62e0c3" />
+
+
 ## What This Code Does
 
 There are 4 main parts.
