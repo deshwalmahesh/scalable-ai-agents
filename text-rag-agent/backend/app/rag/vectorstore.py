@@ -55,6 +55,16 @@ class VectorStore:
 
     async def _ensure_collection(self, dim: int) -> None:
         if await self._client.collection_exists(self._collection):
+            # A collection left over from an older, dense-only schema lacks the bm25 sparse
+            # vector, so every hybrid upsert would fail with a cryptic Qdrant error. Detect
+            # that mismatch and surface an actionable message instead (non-destructive — the
+            # operator drops the collection to have it rebuilt with hybrid search).
+            info = await self._client.get_collection(self._collection)
+            if _BM25 not in (info.config.params.sparse_vectors or {}):
+                raise RuntimeError(
+                    f"Qdrant collection '{self._collection}' predates hybrid search (missing the "
+                    f"'{_BM25}' sparse vector). Delete this collection so it is rebuilt, then re-ingest."
+                )
             return
         try:
             await self._client.create_collection(

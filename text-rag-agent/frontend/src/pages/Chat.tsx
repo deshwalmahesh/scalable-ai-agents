@@ -1,14 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { LogOut, X } from "lucide-react";
+import { LogOut, PanelRight, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import { createChat, getMessages, listChats } from "@/api/chats";
+import { createChat, deleteLastExchange, getMessages, listChats } from "@/api/chats";
 import { streamAnswer } from "@/api/stream";
 import { ChatList } from "@/components/ChatList";
 import { ChatSettings } from "@/components/ChatSettings";
 import { CitationProvider } from "@/components/CitationContext";
 import { Composer } from "@/components/Composer";
-import { DocPanel } from "@/components/DocPanel";
+import { DocsMenu } from "@/components/DocsMenu";
 import { Logo } from "@/components/Logo";
 import { type LiveTurn, MessageList } from "@/components/MessageList";
 import { SourcesRail } from "@/components/SourcesRail";
@@ -30,7 +30,22 @@ export function ChatPage() {
     citations: [],
   });
   const [error, setError] = useState<string | null>(null);
+  const [showSources, setShowSources] = useState(false);
+  const editingRef = useRef(false);
   const textRef = useRef("");
+
+  /** Drop the last user turn and everything after it (its answer) from a message list. */
+  function dropLastExchange(msgs: Message[]): Message[] {
+    let i = msgs.length - 1;
+    while (i >= 0 && msgs[i].role !== "user") i--;
+    return i >= 0 ? msgs.slice(0, i) : msgs;
+  }
+
+  /** Inline edit of the last message: mark it as an edit, then re-ask with the new text. */
+  function submitEdit(content: string) {
+    editingRef.current = true;
+    handleSend(content);
+  }
 
   const { data: chats = [] } = useQuery({ queryKey: ["chats"], queryFn: listChats });
   const activeChat: Chat | undefined = chats.find((c) => c.id === activeChatId);
@@ -61,11 +76,22 @@ export function ChatPage() {
     setLive(null);
     setError(null);
     setFocused({ id: null, citations: [] });
+    editingRef.current = false;
   }
 
   async function handleSend(question: string) {
     setError(null);
     let chatId = activeChatId;
+    // Editing the last message: remove that turn + its answer, then re-ask with the new text.
+    if (editingRef.current && chatId) {
+      editingRef.current = false;
+      try {
+        await deleteLastExchange(chatId);
+      } catch {
+        /* if it's already gone, the re-ask below still works */
+      }
+      qc.setQueryData<Message[]>(["messages", chatId], (old = []) => dropLastExchange(old));
+    }
     if (!chatId) {
       const c = await newChat.mutateAsync(question.slice(0, 48));
       chatId = c.id;
@@ -92,10 +118,17 @@ export function ChatPage() {
         qc.invalidateQueries({ queryKey: ["chats"] });
       },
       onVerdict: (v) => {
-        // Arrives just after `done`; attach it to the finalized assistant message.
+        // Arrives just after `done`: attach the verdict and the enriched citations (which now
+        // carry used_quote spans for line-level highlighting) to the finalized message.
+        const verdict = { source: v.source, grounded: v.grounded, correct: v.correct, reason: v.reason };
         qc.setQueryData<Message[]>(["messages", cid], (old = []) =>
-          old.map((m) => (m.id === v.message_id ? { ...m, verdict: v } : m)),
+          old.map((m) =>
+            m.id === v.message_id ? { ...m, verdict, ...(v.citations ? { citations: v.citations } : {}) } : m,
+          ),
         );
+        if (v.citations) {
+          setFocused((f) => (f.id === v.message_id ? { ...f, citations: v.citations! } : f));
+        }
       },
       onError: (msg) => {
         setError(msg);
@@ -110,7 +143,7 @@ export function ChatPage() {
       <div className="flex h-screen bg-paper text-ink">
         {/* Left rail */}
         <aside className="flex w-64 shrink-0 flex-col border-r border-line bg-surface-2/40">
-          <div className="flex items-center gap-2 px-4 py-3.5">
+          <div className="flex h-14 shrink-0 items-center gap-2 border-b border-line px-4">
             <Logo size={22} />
             <span className="font-serif text-lg font-semibold tracking-tight">DocuMind</span>
           </div>
@@ -121,8 +154,6 @@ export function ChatPage() {
               onSelect={selectChat}
               onNew={() => selectChat(null)}
             />
-            <div className="mx-3 border-t border-line" />
-            <DocPanel />
           </div>
           <div className="flex items-center justify-between border-t border-line px-3 py-2.5">
             <span className="truncate text-xs text-muted" title={user?.email}>
@@ -144,7 +175,20 @@ export function ChatPage() {
             <h1 className="truncate font-serif text-base text-ink">
               {activeChat?.title ?? "New chat"}
             </h1>
-            {activeChat && <ChatSettings chat={activeChat} />}
+            <div className="flex items-center gap-1">
+              <DocsMenu chat={activeChat} />
+              {activeChat && <ChatSettings chat={activeChat} />}
+              <button
+                onClick={() => setShowSources(true)}
+                aria-label="Show sources"
+                className="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-muted hover:bg-surface-2 hover:text-ink lg:hidden"
+              >
+                <PanelRight className="size-4" />
+                <span className="font-mono text-xs">
+                  Sources{focused.citations.length ? ` · ${focused.citations.length}` : ""}
+                </span>
+              </button>
+            </div>
           </header>
 
           {error && (
@@ -162,14 +206,19 @@ export function ChatPage() {
               live={live}
               focusedId={focused.id}
               onFocus={(id, citations) => setFocused({ id, citations })}
+              onEditSubmit={submitEdit}
             />
           </div>
 
-          <Composer disabled={!!live?.streaming} onSend={handleSend} />
+          <Composer disabled={!!live?.streaming} onSend={handleSend} chat={activeChat} />
         </main>
 
-        {/* Right rail */}
-        <SourcesRail citations={focused.citations} />
+        {/* Right rail — persistent on wide screens, toggle-able drawer below lg */}
+        <SourcesRail
+          citations={focused.citations}
+          open={showSources}
+          onClose={() => setShowSources(false)}
+        />
       </div>
     </CitationProvider>
   );

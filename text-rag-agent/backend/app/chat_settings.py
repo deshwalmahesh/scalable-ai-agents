@@ -18,6 +18,10 @@ class ChatSettings(BaseModel):
     history_turns: int = Field(ge=0, le=50)
     context_token_budget: int = Field(ge=1000, le=200_000)
     temperature: float = Field(ge=0.0, le=2.0)
+    model: str  # chat model for this chat (validated against config.available_chat_models at use)
+    # Ingest-time knobs applied to NEW uploads made from this chat (existing docs keep their chunking).
+    chunk_size: int = Field(ge=200, le=4000)
+    chunk_overlap: int = Field(ge=0, le=1000)
     document_ids: list[UUID] | None = None
 
 
@@ -29,7 +33,15 @@ class ChatSettingsPatch(BaseModel):
     history_turns: int | None = Field(default=None, ge=0, le=50)
     context_token_budget: int | None = Field(default=None, ge=1000, le=200_000)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    model: str | None = None
+    chunk_size: int | None = Field(default=None, ge=200, le=4000)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=1000)
     document_ids: list[UUID] | None = None
+
+
+def available_models() -> list[str]:
+    """Selectable chat models (single source: config)."""
+    return [m.strip() for m in get_settings().available_chat_models.split(",") if m.strip()]
 
 
 def resolve_settings(stored: dict | None) -> ChatSettings:
@@ -40,7 +52,13 @@ def resolve_settings(stored: dict | None) -> ChatSettings:
         "history_turns": s.history_turns,
         "context_token_budget": s.context_token_budget,
         "temperature": s.llm_temperature,
+        "model": s.chat_model,
+        "chunk_size": s.chunk_size,
+        "chunk_overlap": s.chunk_overlap,
         "document_ids": None,
     }
     values.update({k: v for k, v in (stored or {}).items() if v is not None})
+    # A stored model no longer offered falls back to the default (never send an invalid model).
+    if values["model"] not in available_models():
+        values["model"] = s.chat_model
     return ChatSettings(**values)

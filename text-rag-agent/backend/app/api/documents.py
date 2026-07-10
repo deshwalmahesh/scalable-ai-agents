@@ -47,7 +47,10 @@ async def _check_load(request: Request) -> None:
         log.warning("load_probe.unavailable", error=str(exc))
         return
     if depth >= s.max_queue_depth:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Service busy — try again shortly.")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The server is busy processing uploads right now. Please try again in a moment.",
+        )
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -61,14 +64,20 @@ async def upload(
 ) -> list[dict]:
     s = get_settings()
     if len(files) > s.max_upload_files:
-        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, f"too many files (max {s.max_upload_files})")
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"You can upload at most {s.max_upload_files} files at once.",
+        )
     await _check_load(request)
 
     max_bytes = s.max_upload_mb * 1024 * 1024
     out: list[dict] = []
     for f in files:
         if extension(f.filename or "") not in SUPPORTED:
-            raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, f"unsupported type: {f.filename}")
+            raise HTTPException(
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                f'"{f.filename}" isn\'t a supported file type. Upload a PDF, DOCX, DOC, TXT, or MD file.',
+            )
         try:
             doc = await stage_and_enqueue(
                 session,
@@ -81,7 +90,8 @@ async def upload(
             )
         except ValueError as exc:
             raise HTTPException(
-                status.HTTP_413_CONTENT_TOO_LARGE, f"{f.filename} exceeds {s.max_upload_mb} MB"
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                f'"{f.filename}" is larger than the {s.max_upload_mb} MB limit.',
             ) from exc
         out.append(_to_response(doc))
     return out
@@ -103,7 +113,7 @@ async def get_one(
 ) -> dict:
     doc = await get_document(session, doc_id=doc_id, user_id=user.id)
     if doc is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That document could not be found.")
     return _to_response(doc)
 
 
@@ -115,7 +125,7 @@ async def delete(
 ) -> None:
     doc = await get_document(session, doc_id=doc_id, user_id=user.id)
     if doc is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That document could not be found.")
     await get_vector_store().delete_document(user_id=user.id, document_id=doc_id)
     await delete_blob(session, document_id=doc_id)
     await delete_document(session, doc_id=doc_id, user_id=user.id)

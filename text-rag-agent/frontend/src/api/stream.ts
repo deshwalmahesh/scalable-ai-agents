@@ -1,4 +1,4 @@
-import { API_BASE, authHeaders } from "@/api/client";
+import { API_BASE, authHeaders, errorMessage } from "@/api/client";
 import type { Citation, Verdict } from "@/types";
 
 export interface StreamDone {
@@ -7,7 +7,7 @@ export interface StreamDone {
   grounded: boolean;
 }
 
-export type StreamVerdict = Verdict & { message_id: string };
+export type StreamVerdict = Verdict & { message_id: string; citations?: Citation[] };
 
 export interface StreamHandlers {
   onToken: (text: string) => void;
@@ -51,14 +51,13 @@ export async function streamAnswer(
     signal,
   });
   if (!res.ok || !res.body) {
-    let detail = `Request failed (${res.status})`;
+    let body: unknown = null;
     try {
-      const j = await res.json();
-      if (typeof j.detail === "string") detail = j.detail;
+      body = await res.json();
     } catch {
-      /* ignore */
+      /* non-JSON error body */
     }
-    h.onError(detail);
+    h.onError(errorMessage(body, res.status));
     return;
   }
 

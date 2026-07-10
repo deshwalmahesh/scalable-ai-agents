@@ -3,7 +3,7 @@ import { type CSSProperties } from "react";
 
 import { useCitations } from "@/components/CitationContext";
 import { citeVar, cn } from "@/lib/utils";
-import type { Verdict } from "@/types";
+import type { Citation, Verdict } from "@/types";
 
 function CitationChip({ n }: { n: number }) {
   const { activeN, setActiveN } = useCitations();
@@ -64,11 +64,13 @@ function VerdictBadge({ verdict }: { verdict: Verdict }) {
 
 export function AnswerMessage({
   content,
+  citations,
   grounded,
   streaming,
   verdict,
 }: {
   content: string;
+  citations?: Citation[];
   grounded: boolean | null;
   streaming?: boolean;
   verdict?: Verdict | null;
@@ -84,13 +86,20 @@ export function AnswerMessage({
     );
   }
 
+  // Known citation numbers (null while streaming, before `done` delivers them). An orphan [n]
+  // the model emitted for a source that wasn't retrieved is dropped, not shown as a dead chip.
+  const validNs = citations ? new Set(citations.map((c) => c.n)) : null;
   const parts = content.split(/(\[\d+\])/g);
   return (
     <div>
       <div className="font-serif text-[1.02rem] leading-[1.75] text-ink whitespace-pre-wrap [text-wrap:pretty]">
         {parts.map((part, i) => {
           const m = part.match(/^\[(\d+)\]$/);
-          if (m) return <CitationChip key={i} n={Number(m[1])} />;
+          if (m) {
+            const n = Number(m[1]);
+            if (validNs && !validNs.has(n)) return null; // orphan citation → drop
+            return <CitationChip key={i} n={n} />;
+          }
           return <span key={i}>{part}</span>;
         })}
         {streaming && (

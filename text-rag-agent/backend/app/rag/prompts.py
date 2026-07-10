@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from app.rag.vectorstore import Hit
 
-NO_ANSWER = "I couldn't find that in your documents."
+NO_ANSWER = (
+    "I couldn't find an answer to this in your uploaded documents. I'm set up to answer only from "
+    "those documents and not from my own general knowledge, so I can't answer this one. Try "
+    "rephrasing your question, or upload a document that covers it."
+)
 
 SUMMARY_SYSTEM = (
     "You maintain a running summary of a conversation. Merge the new messages into the "

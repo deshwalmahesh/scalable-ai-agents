@@ -20,3 +20,12 @@ export function getMessages(id: string): Promise<Message[]> {
 export function updateSettings(id: string, settings: Partial<ChatSettings>): Promise<Chat> {
   return apiFetch(`/chats/${id}`, { method: "PATCH", body: JSON.stringify(settings) });
 }
+
+export function getModels(): Promise<{ models: string[]; default: string }> {
+  return apiFetch("/chats/models");
+}
+
+/** Remove the last user turn + its answer (for editing). Returns the removed text. */
+export function deleteLastExchange(id: string): Promise<{ content: string }> {
+  return apiFetch(`/chats/${id}/messages/last`, { method: "DELETE" });
+}

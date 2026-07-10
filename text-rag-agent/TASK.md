@@ -34,7 +34,7 @@ A company wants an AI assistant that allows users to upload documents and ask qu
 
  
 
-Requirements:
+# Requirements:
 
  
 
@@ -69,7 +69,7 @@ Requirements:
 
  
 
-Deliverables:
+## Deliverables:
 
 - Complete source code.
 - README.
@@ -79,7 +79,7 @@ Deliverables:
 
  
 
-Engineering:
+## Engineering:
 
 - Docker support.
 - Authentication.
@@ -90,7 +90,7 @@ Engineering:
 
  
 
-Evaluation Criteria:
+## Evaluation Criteria:
 
 - Code quality.
 - Architecture and project structure.

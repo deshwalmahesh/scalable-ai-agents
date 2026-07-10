@@ -15,6 +15,9 @@ def _settings(**kw) -> ChatSettings:
         history_turns=2,
         context_token_budget=1000,
         temperature=0.0,
+        model="gemini-3.1-flash-lite",
+        chunk_size=768,
+        chunk_overlap=128,
         document_ids=None,
     )
     base.update(kw)

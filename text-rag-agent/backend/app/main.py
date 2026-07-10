@@ -5,13 +5,15 @@ from pathlib import Path
 
 import structlog
 from fastapi import Depends, FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.chats import router as chats_router
 from app.api.documents import router as documents_router
@@ -100,6 +102,57 @@ async def _request_logger(request: Request, call_next):
     return response
 
 
+# fastapi-users surfaces raw codes as the error detail; translate to human-readable text so
+# no client (SPA, Swagger, curl) ever sees a bare code. Our own HTTPExceptions already carry
+# readable strings and pass through unchanged.
+_AUTH_MESSAGES = {
+    "LOGIN_BAD_CREDENTIALS": "Incorrect email or password.",
+    "LOGIN_USER_NOT_VERIFIED": "Please verify your email address before signing in.",
+    "REGISTER_USER_ALREADY_EXISTS": "An account with that email already exists.",
+    "VERIFY_USER_BAD_TOKEN": "That verification link is invalid or has expired.",
+    "VERIFY_USER_ALREADY_VERIFIED": "Your email address is already verified.",
+    "RESET_PASSWORD_BAD_TOKEN": "That reset link is invalid or has expired.",
+    "UPDATE_USER_EMAIL_ALREADY_EXISTS": "An account with that email already exists.",
+}
+_GENERIC = "Request could not be processed."
+
+
+def _humanize(detail) -> str:
+    """Flatten any HTTPException detail (bare code, {code, reason}, or plain string) to a
+    human-readable message."""
+    if isinstance(detail, dict):  # e.g. {"code": "REGISTER_INVALID_PASSWORD", "reason": "..."}
+        return detail.get("reason") or _AUTH_MESSAGES.get(detail.get("code", ""), _GENERIC)
+    if isinstance(detail, str):
+        return _AUTH_MESSAGES.get(detail, detail)
+    return _GENERIC
+
+
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    return JSONResponse(
+        {"detail": _humanize(exc.detail)}, status_code=exc.status_code, headers=getattr(exc, "headers", None)
+    )
+
+
+async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Turn pydantic body-validation errors into one readable sentence (e.g. bad email on register)."""
+    err = (exc.errors() or [{}])[0]
+    loc = err.get("loc", [])
+    if loc and loc[-1] == "email":
+        message = "Please enter a valid email address."
+    else:
+        field = str(loc[-1]) if loc else "input"
+        message = f"{field}: {err.get('msg', 'invalid value')}"
+    return JSONResponse({"detail": message}, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """slowapi's default returns {"error": ...}; return {"detail": ...} so clients read one shape."""
+    return JSONResponse(
+        {"detail": "Too many requests — please wait a moment and try again."},
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+    )
+
+
 async def _security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -122,7 +175,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title="DocuMind — Document RAG Assistant", version="0.1.0", lifespan=lifespan)
 
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(RequestValidationError, _validation_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)  # type: ignore[arg-type]
     app.add_middleware(SlowAPIMiddleware)
     app.add_middleware(
         CORSMiddleware,

@@ -122,13 +122,17 @@ class LLM:
         return resp.choices[0].message.content or ""
 
     async def stream_chat(
-        self, messages: list[dict], usage_out: dict | None = None, temperature: float | None = None
+        self,
+        messages: list[dict],
+        usage_out: dict | None = None,
+        temperature: float | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield answer text deltas. Final token usage is written into usage_out."""
         self._guard()
         try:
             stream = await self._client.chat.completions.create(
-                model=self._chat_model,
+                model=model or self._chat_model,
                 messages=cast("list[ChatCompletionMessageParam]", messages),
                 temperature=self._temperature if temperature is None else temperature,
                 stream=True,

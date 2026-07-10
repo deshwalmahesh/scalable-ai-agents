@@ -22,6 +22,9 @@ export interface ChatSettings {
   history_turns: number;
   context_token_budget: number;
   temperature: number;
+  model: string;
+  chunk_size: number;
+  chunk_overlap: number;
   document_ids: string[] | null;
 }
 
@@ -41,6 +44,8 @@ export interface Citation {
   page: number | null;
   score: number;
   snippet: string;
+  cited?: boolean; // the answer referenced this source's [n]
+  used_quote?: string | null; // exact span the answer drew from this source (line-level provenance)
 }
 
 export interface Verdict {

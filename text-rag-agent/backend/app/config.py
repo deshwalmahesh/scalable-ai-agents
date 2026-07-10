@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     chat_model: str = "gemini-3.1-flash-lite"
+    # User-selectable chat models (per-chat dropdown). Same provider/key — swap the model only.
+    # Full BYOK (arbitrary model + key + base_url) is intentionally out of scope; change the list
+    # or the provider via env when needed.
+    available_chat_models: str = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-2.5-flash"
     embed_model: str = "gemini-embedding-2"
     embed_dim: int = 768  # requested; real collection size is auto-detected at startup
     llm_timeout_s: int = 60
@@ -25,10 +29,10 @@ class Settings(BaseSettings):
     llm_breaker_cooldown_s: int = 30  # fail-fast window while open (avoids retry storms)
     llm_temperature: float = 0.0
 
-    # Ingestion-time defaults (per-upload overridable). 1000 chars ~= 250 tokens, a common
-    # RAG chunk size; 15% overlap preserves context across boundaries.
-    chunk_size: int = 2048
-    chunk_overlap: int = 256
+    # Ingestion-time defaults (per-chat + per-upload overridable). 768 chars ~= 190 tokens —
+    # tighter chunks give more precise retrieval/citations; ~17% overlap keeps cross-boundary context.
+    chunk_size: int = 768
+    chunk_overlap: int = 128
     embed_concurrency: int = 8
 
     # Query-time defaults (per-chat overridable via ChatSettings).

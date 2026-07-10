@@ -8,6 +8,7 @@ The DB session is never held during the LLM token stream.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from uuid import UUID
@@ -18,7 +19,7 @@ from app.chat_settings import ChatSettings, resolve_settings
 from app.config import get_settings
 from app.db import get_session_factory
 from app.db.models import MessageDB
-from app.db.repos import add_message, get_chat, messages_since, set_chat_memory, set_message_verdict
+from app.db.repos import add_message, get_chat, messages_since, set_chat_memory, set_message_analysis
 from app.errors import classify
 from app.llm import get_llm
 from app.quota import add_usage
@@ -35,6 +36,20 @@ def _sse(event: str, data) -> dict:
 
 def _est_tokens(text: str) -> int:
     return len(text) // get_settings().chars_per_token + 1
+
+
+def _apply_used_spans(citations: list[dict], used: dict) -> list[dict]:
+    """Attach `used_quote` to each citation: the verbatim span the answer drew from that source
+    (located case-insensitively in the snippet). Missing / not-found → no highlight (graceful)."""
+    for c in citations:
+        quote = (used or {}).get(str(c["n"]))
+        c["used_quote"] = None
+        if isinstance(quote, str) and quote.strip():
+            snippet = c.get("snippet", "")
+            i = snippet.lower().find(quote.strip().lower())
+            if i != -1:
+                c["used_quote"] = snippet[i : i + len(quote.strip())]
+    return citations
 
 
 def split_window(pending: list[MessageDB], settings: ChatSettings) -> tuple[list[MessageDB], list[MessageDB]]:
@@ -73,7 +88,7 @@ async def stream_answer(
     async with sf() as s:
         chat = await get_chat(s, chat_id=chat_id, user_id=user_id)
         if chat is None:  # deleted between the route check and here
-            yield _sse("error", {"message": "chat not found"})
+            yield _sse("error", {"message": "That chat could not be found."})
             return
         settings = resolve_settings(chat.settings)
         prior_summary = chat.summary
@@ -114,7 +129,9 @@ async def stream_answer(
     parts: list[str] = []
     t1 = time.monotonic()
     try:
-        async for delta in get_llm().stream_chat(messages, usage, temperature=settings.temperature):
+        async for delta in get_llm().stream_chat(
+            messages, usage, temperature=settings.temperature, model=settings.model
+        ):
             parts.append(delta)
             yield _sse("token", delta)
     except Exception as exc:  # noqa: BLE001 — stream already 200; surface as an SSE error event
@@ -123,6 +140,11 @@ async def stream_answer(
         return
 
     answer = "".join(parts)
+    # A source is "cited" iff the answer references its [n] — the answer is the source of truth
+    # for what was used (the judge only adds the exact highlight span, if it can locate one).
+    cited_ns = {int(x) for x in re.findall(r"\[(\d+)\]", answer)}
+    for c in citations:
+        c["cited"] = c["n"] in cited_ns
     # Fallback when the provider omits streaming usage, so quota still meters.
     total_tokens = usage.get("total_tokens") or (
         _est_tokens("".join(m["content"] for m in messages)) + _est_tokens(answer)
@@ -148,15 +170,19 @@ async def stream_answer(
             verdict = await judge_answer(
                 question=question, context=build_context(hits), history=history_text, answer=answer
             )
+            # Line-level provenance: highlight the exact span each source contributed.
+            used = verdict.pop("used", {})
+            citations = _apply_used_spans(citations, used)
             async with sf() as s:
-                await set_message_verdict(s, message_id=msg.id, verdict=verdict)
+                await set_message_analysis(s, message_id=msg.id, citations=citations, verdict=verdict)
             log.info(
                 "answer.judged",
                 chat_id=str(chat_id),
                 source=verdict.get("source"),
                 grounded=verdict.get("grounded"),
                 correct=verdict.get("correct"),
+                spans=sum(1 for c in citations if c.get("used_quote")),
             )
-            yield _sse("verdict", {"message_id": str(msg.id), **verdict})
-        except Exception as exc:  # noqa: BLE001 — eval is best-effort; never fail a delivered answer
+            yield _sse("verdict", {"message_id": str(msg.id), "citations": citations, **verdict})
+        except Exception as exc:  # noqa: BLE001 — analysis is best-effort; never fail a delivered answer
             log.warning("answer.judge_failed", chat_id=str(chat_id), error=str(exc))

@@ -28,8 +28,13 @@ JUDGE_SYSTEM = (
     "available information. If the answer is a refusal, correct is true when the information "
     "was genuinely absent from both the context and the conversation (a correct refusal).\n"
     "- reason: one short sentence.\n"
+    "- used: an object mapping EVERY source number the answer cites inline as [n] to the SHORTEST "
+    "EXACT substring COPIED VERBATIM from that source (same characters, casing, and punctuation) "
+    "that supports the answer. Cover every cited [n]; if a cited source was paraphrased, still pick "
+    "the closest verbatim phrase from it. Omit only sources the answer never cites. Empty object "
+    "for a refusal.\n"
     'Reply with ONLY a JSON object: {"source": "...", "grounded": bool, "correct": bool, '
-    '"reason": "..."}'
+    '"reason": "...", "used": {"1": "verbatim quote", ...}}'
 )
 
 

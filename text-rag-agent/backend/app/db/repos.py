@@ -12,13 +12,30 @@ from app.db.models import ChatDB, DocumentBlobDB, DocumentDB, MessageDB
 
 # --- documents ---------------------------------------------------------------
 async def create_document(
-    s: AsyncSession, *, user_id: UUID, filename: str, mime: str, size: int
+    s: AsyncSession, *, user_id: UUID, filename: str, mime: str, size: int, content_hash: str | None = None
 ) -> DocumentDB:
-    doc = DocumentDB(user_id=user_id, filename=filename, mime=mime, size=size, status="pending")
+    doc = DocumentDB(
+        user_id=user_id, filename=filename, mime=mime, size=size, status="pending", content_hash=content_hash
+    )
     s.add(doc)
     await s.commit()
     await s.refresh(doc)
     return doc
+
+
+async def get_document_by_hash(s: AsyncSession, *, user_id: UUID, content_hash: str) -> DocumentDB | None:
+    """Most recent document with this content for the user (for upload de-duplication)."""
+    return (
+        (
+            await s.execute(
+                select(DocumentDB)
+                .where(DocumentDB.user_id == user_id, DocumentDB.content_hash == content_hash)
+                .order_by(DocumentDB.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
 
 
 async def get_document(s: AsyncSession, *, doc_id: UUID, user_id: UUID) -> DocumentDB | None:
@@ -142,9 +159,11 @@ async def add_message(
     return msg
 
 
-async def set_message_verdict(s: AsyncSession, *, message_id: UUID, verdict: dict) -> None:
+async def set_message_analysis(s: AsyncSession, *, message_id: UUID, citations: list, verdict: dict) -> None:
+    """Persist the post-stream analysis: enriched citations (with used_quote) + judge verdict."""
     msg = await s.get(MessageDB, message_id)
     if msg is not None:
+        msg.citations = citations
         msg.verdict = verdict
         await s.commit()
 
@@ -157,6 +176,20 @@ async def list_messages(s: AsyncSession, *, chat_id: UUID) -> list[MessageDB]:
             )
         ).scalars()
     )
+
+
+async def delete_last_exchange(s: AsyncSession, *, chat_id: UUID) -> str | None:
+    """Remove the last user message and everything after it (its assistant answer), for editing.
+    Returns the removed user message's content, or None if there is no user message."""
+    msgs = await list_messages(s, chat_id=chat_id)  # oldest first
+    last_user = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].role == "user"), None)
+    if last_user is None:
+        return None
+    content = msgs[last_user].content
+    for m in msgs[last_user:]:
+        await s.delete(m)
+    await s.commit()
+    return content
 
 
 async def messages_since(s: AsyncSession, *, chat_id: UUID, after) -> list[MessageDB]:

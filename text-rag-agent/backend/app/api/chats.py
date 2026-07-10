@@ -10,13 +10,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from app.chat_settings import ChatSettingsPatch, resolve_settings
+from app.chat_settings import ChatSettingsPatch, available_models, resolve_settings
 from app.config import get_settings
 from app.db import get_async_session
 from app.db.models import UserDB
 from app.db.repos import (
     create_chat,
     delete_chat,
+    delete_last_exchange,
     get_chat,
     list_chats,
     list_messages,
@@ -72,6 +73,12 @@ async def list_mine(
     return [_to_response(c) for c in await list_chats(session, user_id=user.id)]
 
 
+@router.get("/models")
+async def models(user: Annotated[UserDB, Depends(current_active_user)]) -> dict:
+    """Selectable chat models for the per-chat dropdown (single source: config)."""
+    return {"models": available_models(), "default": get_settings().chat_model}
+
+
 @router.get("/{chat_id}")
 async def get_one(
     chat_id: UUID,
@@ -80,7 +87,7 @@ async def get_one(
 ) -> dict:
     chat = await get_chat(session, chat_id=chat_id, user_id=user.id)
     if chat is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "chat not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That chat could not be found.")
     return _to_response(chat)
 
 
@@ -94,7 +101,7 @@ async def patch(
     updates = body.model_dump(mode="json", exclude_none=True)
     chat = await update_chat_settings(session, chat_id=chat_id, user_id=user.id, settings=updates)
     if chat is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "chat not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That chat could not be found.")
     return _to_response(chat)
 
 
@@ -105,7 +112,7 @@ async def delete(
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> None:
     if not await delete_chat(session, chat_id=chat_id, user_id=user.id):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "chat not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That chat could not be found.")
 
 
 @router.get("/{chat_id}/messages")
@@ -115,7 +122,7 @@ async def messages(
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> list[dict]:
     if await get_chat(session, chat_id=chat_id, user_id=user.id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "chat not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That chat could not be found.")
     return [
         {
             "id": str(m.id),
@@ -129,6 +136,21 @@ async def messages(
     ]
 
 
+@router.delete("/{chat_id}/messages/last")
+async def delete_last(
+    chat_id: UUID,
+    user: Annotated[UserDB, Depends(current_active_user)],
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> dict:
+    """Remove the last user turn and its answer (for editing/regenerating). Returns the removed text."""
+    if await get_chat(session, chat_id=chat_id, user_id=user.id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That chat could not be found.")
+    content = await delete_last_exchange(session, chat_id=chat_id)
+    if content is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "There is no message to edit.")
+    return {"content": content}
+
+
 @router.post("/{chat_id}/query")
 async def query(
     chat_id: UUID,
@@ -138,9 +160,12 @@ async def query(
 ) -> EventSourceResponse:
     s = get_settings()
     if len(body.question) > s.max_question_chars:
-        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "question too long")
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"Your question is too long (max {s.max_question_chars} characters). Please shorten it.",
+        )
     if await get_chat(session, chat_id=chat_id, user_id=user.id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "chat not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That chat could not be found.")
 
     try:
         await enforce_quota(user.id, user.plan)

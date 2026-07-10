@@ -26,6 +26,25 @@ export function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+/** Pull a human-readable message out of any error body shape the API might return
+ *  (string detail, {code, reason}, [validation errors], {error}) with a friendly fallback. */
+export function errorMessage(body: unknown, status: number): string {
+  const b = (body ?? {}) as { detail?: unknown; error?: unknown; message?: unknown };
+  const d = b.detail;
+  if (typeof d === "string" && d.trim()) return d;
+  if (Array.isArray(d) && (d[0] as { msg?: string })?.msg) return (d[0] as { msg: string }).msg;
+  if (d && typeof d === "object") {
+    const o = d as { reason?: string; msg?: string };
+    if (o.reason) return o.reason;
+    if (o.msg) return o.msg;
+  }
+  if (typeof b.error === "string" && b.error.trim()) return b.error;
+  if (typeof b.message === "string" && b.message.trim()) return b.message;
+  return status >= 500
+    ? "Something went wrong on our end. Please try again."
+    : "Something went wrong. Please try again.";
+}
+
 export async function apiFetch<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const headers = new Headers(opts.headers);
   for (const [k, v] of Object.entries(authHeaders())) headers.set(k, v);
@@ -37,14 +56,13 @@ export async function apiFetch<T>(path: string, opts: RequestInit = {}): Promise
 
   const res = await fetch(API_BASE + path, { ...opts, headers });
   if (!res.ok) {
-    let detail = `Request failed (${res.status})`;
+    let body: unknown = null;
     try {
-      const j = await res.json();
-      if (typeof j.detail === "string") detail = j.detail;
+      body = await res.json();
     } catch {
       /* non-JSON error body */
     }
-    throw new ApiError(detail, res.status);
+    throw new ApiError(errorMessage(body, res.status), res.status);
   }
   return res.status === 204 ? (undefined as T) : res.json();
 }

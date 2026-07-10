@@ -7,6 +7,7 @@ the worker, and deleted once ingested — portable to any managed Postgres."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from uuid import UUID
 
 import structlog
@@ -16,7 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db import get_session_factory
 from app.db.models import DocumentDB
-from app.db.repos import create_document, delete_blob, load_blob, save_blob, set_document_status
+from app.db.repos import (
+    create_document,
+    delete_blob,
+    get_document_by_hash,
+    load_blob,
+    save_blob,
+    set_document_status,
+)
 from app.rag import pipeline
 
 log = structlog.get_logger()
@@ -47,12 +55,22 @@ async def stage_and_enqueue(
     """Persist the document row + raw bytes, then enqueue ingestion. Raises ValueError if
     the file exceeds max_bytes (caller maps to 413)."""
     data = await _read_bounded(file, max_bytes)
+
+    # De-dup: identical content already indexed (or in flight) for this user is reused instead
+    # of re-embedding. A prior failed attempt is NOT reused, so retries still work.
+    content_hash = hashlib.sha256(data).hexdigest()
+    existing = await get_document_by_hash(session, user_id=user_id, content_hash=content_hash)
+    if existing is not None and existing.status in ("pending", "processing", "ready"):
+        log.info("document.duplicate_skipped", document_id=str(existing.id), filename=existing.filename)
+        return existing
+
     doc = await create_document(
         session,
         user_id=user_id,
         filename=file.filename or "upload",
         mime=file.content_type or "",
         size=len(data),
+        content_hash=content_hash,
     )
     await save_blob(session, document_id=doc.id, data=data)
     await enqueue_ingest(

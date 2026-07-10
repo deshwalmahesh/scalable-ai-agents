@@ -8,19 +8,45 @@ Answers questions **only** from your uploaded documents (PDF · DOCX · DOC · T
 citations, and clearly says *"I couldn't find that in your documents"* when the answer isn't there —
 instead of hallucinating. Every answer is scored in realtime by an LLM judge for groundedness.
 
+<img src="docs/screenshot.png" alt="DocuMind — streamed answer with inline citations, grounding verdict, and a Sources panel highlighting the exact passages used" width="100%" />
+
 </div>
 
-## What it does
+## Features
 
-- Upload one or more documents (mixed formats) → they're extracted, chunked, embedded, and
-  indexed in a vector store.
-- Ask questions in a chat → the assistant retrieves the most relevant passages and answers
-  **grounded only in them**, streaming the answer token-by-token with citations (filename, page,
-  snippet, similarity score).
-- Refuses to answer when retrieval finds nothing relevant (two-layer guard: a similarity gate +
-  a strict prompt contract).
-- Scores each answer live (LLM-as-Judge: source / grounded / correct) — shown as a badge under it.
-- Multi-user with JWT auth; each user's documents and chats are fully isolated.
+**Documents & retrieval**
+- Upload one or more files (**PDF · DOCX · DOC · TXT · MD**, mixed in one request) → extracted,
+  chunked, embedded, and indexed in Qdrant.
+- **Hybrid search**: dense (cosine) + BM25 sparse, fused with Reciprocal Rank Fusion in Qdrant.
+- **Per-user document library + per-chat scope**: files are uploaded once (embedded once) and reused
+  across chats; each chat chooses *which* documents it queries (default: all).
+- **Upload de-duplication**: identical content (SHA-256) is reused instead of re-embedded.
+
+**Answering & provenance**
+- Streams the answer **token-by-token** (SSE) with inline `[n]` citations.
+- **Sources panel**: one card per retrieved passage — filename · page · **similarity score** · snippet,
+  colour-matched to the `[n]` chips (hover to link both).
+- **Line-level provenance**: the exact span the answer drew from each source is **highlighted** inside
+  the snippet; cited sources auto-expand and sort to the top, uncited ones collapse.
+- **Refuses** when nothing relevant is found — two-layer guard: a similarity gate (no LLM call) + a
+  strict prompt contract — instead of hallucinating.
+- **Live grounding verdict** (LLM-as-Judge): every answer is scored for **source / grounded / correct**
+  and shown as a badge under it.
+
+**Chat**
+- Multi-chat with **conversation history** (verbatim recent window + rolling summary of older turns).
+- **Edit the last message**: removes that turn *and* its answer, then re-asks the edited question.
+- **Per-chat settings** (one popover): model, top-k, min-similarity, temperature, history turns,
+  context budget, chunk size/overlap (chunking applies to new uploads).
+- **Model picker**: choose the chat model per chat from a configurable list (no code change).
+
+**Platform**
+- **Multi-user JWT auth** (register / login / password reset / email verify); each user's documents
+  and chats are fully isolated (per-tenant filter on every query).
+- **Async ingestion** via an arq worker (upload returns immediately; UI polls status).
+- **Human-readable errors everywhere** — no raw provider/framework codes reach the client.
+- **Scalable & portable**: stateless API, bounded concurrency, per-user token quota + concurrency caps,
+  rate limiting, Prometheus metrics, structured logs; deploys as one image to any container host.
 
 ## Architecture
 
@@ -96,7 +122,8 @@ flowchart TB
 |---|---|
 | API | FastAPI, Uvicorn, SSE (`sse-starlette`) |
 | Auth | `fastapi-users` (JWT, argon2/bcrypt, reset/verify) |
-| LLM + embeddings | `openai` SDK → Gemini OpenAI-compatible endpoint (`gemini-3.1-flash-lite`, `gemini-embedding-2`) |
+| LLM + embeddings | `openai` SDK → Gemini OpenAI-compatible endpoint; chat model **per-chat selectable** (`gemini-3.1-flash-lite` default, `gemini-3.5-flash`, `gemini-2.5-flash`), embeddings `gemini-embedding-2` |
+| Grounding eval | LLM-as-Judge (`app/rag/judge.py`) — source / grounded / correct + used-span extraction |
 | Vector DB | Qdrant (async client, per-tenant filter, **hybrid dense + BM25/RRF**) |
 | Sparse vectors | `fastembed` (BM25, computed locally) |
 | Relational DB | Postgres (prod) / SQLite (tests), async SQLAlchemy |
@@ -108,7 +135,9 @@ flowchart TB
 
 ## Run it — one command
 
-Prerequisites: **Docker** and a **Gemini API key** ([get one, free](https://aistudio.google.com/apikey)).
+Prerequisites: **Docker** and a **Gemini API key** — free; see
+[how to get an API key](https://ai.google.dev/gemini-api/docs/api-key) (or grab one directly at
+[aistudio.google.com/apikey](https://aistudio.google.com/apikey)).
 
 ```bash
 export GEMINI_API_KEY=your_key_here   # or edit the .env it generates
@@ -178,22 +207,42 @@ curl -s -X POST $API/documents -H "Authorization: Bearer $TOKEN" \
 # poll status until "ready"
 curl -s $API/documents -H "Authorization: Bearer $TOKEN"
 
-# create a chat, then ask (Server-Sent Events stream: token… then done+citations)
+# create a chat, then ask.
+# SSE stream: `token` deltas → `done` {message_id, citations, grounded} → `verdict`
+# {source, grounded, correct, citations-with-used_quote}  (or `error`).
 CHAT=$(curl -s -X POST $API/chats -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"title":"demo"}' | jq -r .id)
 curl -N -X POST $API/chats/$CHAT/query -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"question":"What is this document about?"}'
+
+# list selectable models · scope a chat to specific docs · edit (drop) the last exchange
+curl -s $API/chats/models -H "Authorization: Bearer $TOKEN"
+curl -s -X PATCH $API/chats/$CHAT -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"model":"gemini-2.5-flash","document_ids":["<doc-id>"]}'
+curl -s -X DELETE $API/chats/$CHAT/messages/last -H "Authorization: Bearer $TOKEN"
 ```
 
-Per-chat retrieval settings (`top_k`, `min_score`, `history_turns`, `context_token_budget`,
-`temperature`, default `document_ids`) are adjustable via `PATCH /chats/{id}`. Chunk size/overlap
-are per-upload query params on `POST /documents`.
+**Per-chat settings** (one contract, `PATCH /chats/{id}`, defaults from config, validated ranges):
+`model`, `top_k`, `min_score`, `history_turns`, `context_token_budget`, `temperature`,
+`chunk_size`, `chunk_overlap`, and `document_ids` (the chat's document scope; `null` = all).
+`chunk_size`/`chunk_overlap` apply to **documents uploaded from then on** (existing docs keep theirs);
+they can also be overridden per upload via `?chunk_size=&chunk_overlap=` on `POST /documents`.
 
 ## Configuration
 
-All config is centralized in `app/config.py` and env-driven — change a URL/model/key in one place.
-Key vars: `GEMINI_API_KEY`, `JWT_SECRET`, `DATABASE_URL`, `REDIS_URL`, `QDRANT_URL`, `CHAT_MODEL`,
-`EMBED_MODEL`, `INGEST_EXECUTOR` (`inline`|`queue`). See `backend/.env.example`.
+All config is centralized in `app/config.py` and env-driven — change a URL/model/key/threshold in one
+place. Key vars:
+
+- **Provider**: `GEMINI_API_KEY`, `LLM_BASE_URL`, `CHAT_MODEL`, `AVAILABLE_CHAT_MODELS` (comma-sep
+  dropdown list), `EMBED_MODEL`, `EMBED_DIM`.
+- **Infra**: `DATABASE_URL`, `REDIS_URL`, `QDRANT_URL` (+ `QDRANT_API_KEY`), `INGEST_EXECUTOR`
+  (`inline`|`queue`).
+- **Auth/security**: `JWT_SECRET`, `MIN_PASSWORD_LENGTH`, `AUTH_MAX_PER_MIN`, `CORS_ORIGINS`.
+- **RAG/eval defaults**: `CHUNK_SIZE` (768), `CHUNK_OVERLAP` (128), `RETRIEVAL_TOP_K`,
+  `RETRIEVAL_MIN_SCORE`, `JUDGE_ENABLED` (on; one extra LLM call per answered query).
+
+Swapping to any OpenAI-compatible provider is just `LLM_BASE_URL` + models + key. See
+`backend/.env.example`.
 
 ## Testing
 
@@ -243,7 +292,7 @@ Every requirement, deliverable, and engineering item mapped to where it lives.
 | 3 | Extract & prepare content | `rag/extract.py` → `rag/chunk.py` |
 | 4 | Vector database | Qdrant (`rag/vectorstore.py`), hybrid dense + BM25 |
 | 5 | RAG pipeline | `rag/pipeline.py` (`ingest` / `retrieve`) + `chat_service` |
-| 6 | Answer + document(s) + snippet/reference | SSE `done` event: answer text + `citations[]` (filename · page · score · snippet) |
+| 6 | Answer + document(s) + snippet/reference | SSE: answer + `citations[]` (filename · page · score · snippet) + **line-level used-span highlight** in the Sources panel |
 | 7 | Refuse when not in documents | Two layers: score gate (`pipeline.retrieve`) + prompt contract (`rag/prompts.py`) |
 | 8 | Clean, maintainable code | Thin routers → services → RAG core; `ruff` + `mypy` clean |
 | 9 | README (arch/tech/setup/run/limits) | This file |
@@ -262,12 +311,22 @@ Every requirement, deliverable, and engineering item mapped to where it lives.
 
 ## Assumptions & limitations
 
-- **Single shared Gemini key** (server-side), not per-user BYOK. Per-user *usage* quota + concurrency
-  caps are enforced. Free-tier embedding quota (~100 req/min) can 429 on bulk ingest — handled
-  gracefully (document goes `failed`, ingestion is idempotent and retryable); a paid tier removes this.
-- **Retrieval is hybrid** — dense (cosine) + BM25 sparse fused with Reciprocal Rank Fusion in Qdrant;
-  the dense cosine is what's shown as the per-source similarity score and drives the "no info" gate.
-- **`create_all` schema bootstrap**, no Alembic migrations yet (v1); swap in migrations for prod.
+- **Single shared Gemini key** (server-side); the model is user-selectable from a fixed list, but full
+  BYOK (arbitrary key/URL per user) is intentionally out of scope — swap the provider via config.
+  Per-user *usage* quota + concurrency caps are enforced. Free-tier embedding quota (~100 req/min) can
+  429 on bulk/large ingest — handled gracefully (document goes `failed`, idempotent & retryable); a
+  paid tier removes this.
+- **Retrieval is hybrid** — dense (cosine) + BM25 sparse fused with RRF in Qdrant; the dense cosine is
+  the per-source similarity score shown to users and drives the "no info" gate.
+- **Line-level highlighting is best-effort**: a source the answer cites always appears as *cited*
+  (expanded); the exact span is highlighted only when the judge can locate a verbatim substring —
+  paraphrased sources show the full cited snippet without a sub-highlight.
+- **De-duplication is per-user by exact content** (SHA-256); a re-upload of identical bytes reuses the
+  existing document. Changing chunk size only affects **new** uploads (existing docs keep their chunking).
+- **Errors are humanized centrally** (exception handlers map framework/provider codes → plain messages);
+  every error response is `{"detail": "<readable>"}`.
+- **`create_all` schema bootstrap**, no Alembic migrations yet (v1) — schema changes need a fresh DB
+  (`docker compose down -v`); swap in migrations for prod. Likewise a Qdrant collection from an older
+  schema is detected and reported, not silently reused.
 - Transient upload bytes live in Postgres (fine at this scale); move to object storage for very large
-  corpora.
-- TLS terminates at the ingress/load balancer (not the app).
+  corpora. TLS terminates at the ingress/load balancer (not the app).

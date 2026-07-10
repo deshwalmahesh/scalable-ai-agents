@@ -24,6 +24,7 @@ class DocumentDB(Base):
     filename: Mapped[str] = mapped_column(String(255))
     mime: Mapped[str] = mapped_column(String(100))
     size: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)  # sha256, dedup
     # pending -> processing -> ready | failed
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

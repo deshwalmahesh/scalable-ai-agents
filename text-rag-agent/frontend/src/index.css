@@ -87,6 +87,36 @@ body {
   outline-offset: 2px;
 }
 
+/* Text fields match :focus-visible even on mouse click, which draws a hard rectangle.
+   They show their own soft focus (wrapper border/ring), so suppress the outline here. */
+input:focus,
+input:focus-visible,
+textarea:focus,
+textarea:focus-visible,
+select:focus,
+select:focus-visible {
+  outline: none;
+}
+
+/* Centralized button feedback — every button (component or raw) gets consistent hover +
+   pressed cues so a click is always visibly registered. Per-button colour hovers compose
+   on top of these. Reduced-motion still shows the state, just without the transition. */
+button:not(:disabled) {
+  cursor: pointer;
+  transition:
+    transform 90ms ease,
+    filter 130ms ease,
+    background-color 130ms ease,
+    opacity 130ms ease;
+}
+button:not(:disabled):hover {
+  filter: brightness(1.05);
+}
+button:not(:disabled):active {
+  transform: scale(0.96);
+  filter: brightness(0.94);
+}
+
 /* Quiet, thin scrollbars */
 * {
   scrollbar-width: thin;
