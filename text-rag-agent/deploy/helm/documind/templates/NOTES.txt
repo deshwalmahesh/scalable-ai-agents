@@ -1,0 +1,14 @@
+{{ .Release.Name }} deployed.
+
+API:    kubectl port-forward svc/{{ .Release.Name }}-api {{ .Values.service.port }}:{{ .Values.service.port }}
+Health: curl localhost:{{ .Values.service.port }}/health
+
+Set secrets at install (or use --set existingSecret=<name>):
+  helm install {{ .Release.Name }} deploy/helm/documind \
+    --set secrets.GEMINI_API_KEY=... \
+    --set secrets.JWT_SECRET=... \
+    --set secrets.DATABASE_URL=... \
+    --set secrets.REDIS_URL=... \
+    --set secrets.QDRANT_URL=...
+
+API autoscaling: {{ .Values.api.autoscaling.enabled }} ({{ .Values.api.autoscaling.minReplicas }}-{{ .Values.api.autoscaling.maxReplicas }} pods). Workers: {{ .Values.worker.replicas }}.

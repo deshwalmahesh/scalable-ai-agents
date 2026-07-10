@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/* Map semantic CSS vars → Tailwind utility tokens (bg-paper, text-ink, font-serif, …). */
+@theme inline {
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-primary: var(--primary);
+  --color-primary-fg: var(--primary-fg);
+  --color-danger: var(--danger);
+
+  --font-sans: var(--font-ui);
+  --font-serif: var(--font-answer);
+  --font-mono: var(--font-mono-);
+
+  --radius-sm: 0.5rem;
+  --radius: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.5rem;
+}
+
+:root {
+  --paper: oklch(0.985 0.004 95);
+  --surface: oklch(1 0 0);
+  --surface-2: oklch(0.975 0.005 95);
+  --ink: oklch(0.27 0.02 220);
+  --muted: oklch(0.53 0.015 220);
+  --line: oklch(0.918 0.006 220);
+  --primary: oklch(0.58 0.09 205);
+  --primary-fg: oklch(0.99 0.004 200);
+  --danger: oklch(0.58 0.13 25);
+
+  /* Signature: 5 soft, distinct citation hues (calm, low-chroma). */
+  --cite-0: oklch(0.62 0.08 200);
+  --cite-1: oklch(0.6 0.1 300);
+  --cite-2: oklch(0.66 0.1 70);
+  --cite-3: oklch(0.62 0.11 20);
+  --cite-4: oklch(0.6 0.08 150);
+
+  --font-ui: "Hanken Grotesk Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-answer: "Fraunces Variable", ui-serif, Georgia, serif;
+  --font-mono-: "Geist Mono Variable", ui-monospace, monospace;
+}
+
+.dark {
+  --paper: oklch(0.2 0.02 235);
+  --surface: oklch(0.238 0.02 235);
+  --surface-2: oklch(0.26 0.02 235);
+  --ink: oklch(0.93 0.01 210);
+  --muted: oklch(0.68 0.015 220);
+  --line: oklch(0.32 0.02 235);
+  --primary: oklch(0.68 0.1 200);
+  --primary-fg: oklch(0.16 0.02 235);
+  --danger: oklch(0.68 0.14 25);
+
+  --cite-0: oklch(0.72 0.09 200);
+  --cite-1: oklch(0.72 0.1 300);
+  --cite-2: oklch(0.78 0.1 70);
+  --cite-3: oklch(0.72 0.11 20);
+  --cite-4: oklch(0.72 0.09 150);
+}
+
+* {
+  border-color: var(--line);
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in oklch, var(--primary) 22%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* Quiet, thin scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--ink) 18%, transparent) transparent;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+.animate-rise { animation: rise 0.4s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.animate-pulse-soft { animation: pulse-soft 1.6s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

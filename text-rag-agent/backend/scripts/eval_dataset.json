@@ -1,0 +1,44 @@
+{
+  "document": "sample_docs/SAMPLE_MD.md",
+  "cases": [
+    {
+      "id": "doc-formats",
+      "question": "Which document formats can users upload?",
+      "expect": "answer",
+      "gold": "PDF, DOCX, and TXT."
+    },
+    {
+      "id": "doc-refusal-rule",
+      "question": "What must the assistant do if the answer is not in the uploaded documents?",
+      "expect": "answer",
+      "gold": "Clearly indicate that no relevant information was found instead of generating an incorrect answer."
+    },
+    {
+      "id": "doc-vectordb",
+      "question": "Which vector databases are named as options?",
+      "expect": "answer",
+      "gold": "FAISS, ChromaDB, Pinecone, Qdrant."
+    },
+    {
+      "id": "oos-france",
+      "question": "What is the capital of France?",
+      "expect": "refuse"
+    },
+    {
+      "id": "oos-pricing",
+      "question": "How much does this product cost per month?",
+      "expect": "refuse"
+    },
+    {
+      "id": "history-only",
+      "question": "What did I say my project deadline is?",
+      "expect": "answer",
+      "gold": "March 3rd.",
+      "history": [
+        {"role": "user", "content": "For context, my project deadline is March 3rd."},
+        {"role": "assistant", "content": "Noted — your project deadline is March 3rd."}
+      ],
+      "note": "Answerable ONLY from conversation history; the fact is not in any document. Probes the history-aware-retrieval gap: the score gate is doc-only, so if the bare question retrieves below min_score the assistant refuses despite the answer being in history."
+    }
+  ]
+}

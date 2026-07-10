@@ -1,0 +1,64 @@
+[project]
+name = "documind-backend"
+version = "0.1.0"
+description = "Document-grounded RAG assistant — answers only from uploaded documents, with citations."
+requires-python = ">=3.11"
+dependencies = [
+    # web
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",       # multipart file uploads (UploadFile)
+    "sse-starlette>=2.1.3",           # streaming answer over SSE
+    "slowapi>=0.1.9",                 # cross-replica IP rate limiting
+    "prometheus-fastapi-instrumentator>=7.0.0",
+    # auth
+    "fastapi-users[sqlalchemy]>=13.0.0",
+    # data
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20.0",              # SQLite (dev/tests)
+    "asyncpg>=0.30.0",                # Postgres (prod)
+    "pydantic-settings>=2.6.0",
+    "redis>=5.2.0",                   # rate-limit store + arq broker
+    "arq>=0.26.0",                    # async ingestion worker
+    # rag — OpenAI-compatible client (points at Gemini's OpenAI endpoint; swap base_url
+    # + model in .env to use any OpenAI-compatible provider).
+    "openai>=1.54.0",
+    "langchain-text-splitters>=0.3.0",  # proven RecursiveCharacterTextSplitter (splitter only)
+    "qdrant-client>=1.12.0",         # vector store (async client)
+    "fastembed>=0.4.0",              # BM25 sparse vectors for Qdrant-native hybrid search
+    "pypdf>=5.1.0",                  # PDF extraction
+    "python-docx>=1.1.2",            # DOCX extraction
+    "tenacity>=9.0.0",               # retry transient Qdrant errors (client has none of its own)
+    # ops
+    "structlog>=24.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",                 # ASGI test client
+    "asgi-lifespan>=2.1.0",          # run app lifespan in async tests
+    "ruff>=0.7.0",                   # lint + format
+    "mypy>=1.13.0",                  # static type checking
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]  # FastAPI Depends() in defaults is the framework idiom
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true   # third-party stubs (qdrant/arq/etc.) not all shipped
+check_untyped_defs = true
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
+exclude = ["tests/"]

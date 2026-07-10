@@ -1,0 +1,53 @@
+# Postgres, Redis, and Qdrant are external managed services (Supabase/Railway/Qdrant Cloud
+# or in-cluster). Provide their URLs via `secrets` below or an `existingSecret`.
+
+image:
+  repository: documind-backend
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Non-secret env — shared by API and worker (single source of truth).
+config:
+  APP_ENV: prod
+  INGEST_EXECUTOR: queue
+  CHAT_MODEL: gemini-3.1-flash-lite
+  EMBED_MODEL: gemini-embedding-2
+  EMBED_DIM: "768"
+
+# Secret env. Set these at install, or point existingSecret at a pre-created Secret with the
+# same keys and leave these blank.
+existingSecret: ""
+secrets:
+  GEMINI_API_KEY: ""
+  JWT_SECRET: ""
+  DATABASE_URL: ""   # postgresql+asyncpg://user:pass@host:5432/db
+  REDIS_URL: ""      # redis://host:6379/0
+  QDRANT_URL: ""     # http://host:6333
+
+api:
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 512Mi}
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+worker:
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  host: documind.local
+  annotations: {}
+  tls: []
