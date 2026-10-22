@@ -86,30 +86,6 @@ PSTN/SIP-ingress voice agent that answers caller questions by retrieving from a 
 
 ---
 
-## Quick Start
-
-Each project is self-contained — navigate to its directory and follow its README.
-
-```bash
-# General Coding Agent (On-Device)
-cd general-coding-agent
-cp .env.example .env # fill in GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY
-uv sync
-uv run python main.py
-
-# Text RAG Agent
-cd text-rag-agent
-export GEMINI_API_KEY=your_key
-make up              # → http://localhost:8000
-
-# Voice Agent
-cd voice-agent
-cp .env.example .env # fill in LiveKit, Twilio, Deepgram, LLM keys
-uv sync
-uv run voice-agent-seed-kb
-sh scripts/start.sh both
-```
-
 ---
 
 ## License
