@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#213b69">
+  <title>Book Writer</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Book Writer home">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 6c5-2 9-1 12 2 3-3 7-4 12-2v20c-5-2-9-1-12 2-3-3-7-4-12-2V6Z"/><path d="M16 8v20"/></svg>
+      <span><strong>Book Writer</strong></span>
+    </a>
+    <div class="header-tools">
+      <span id="service-status" class="service-status">Connecting</span>
+      <span id="account-name" hidden></span>
+      <button id="logout" class="quiet" type="button" hidden>Sign out</button>
+    </div>
+  </header>
+  <main id="main" tabindex="-1">
+    <section id="auth-screen" class="auth-layout" aria-labelledby="welcome-title">
+      <div class="welcome">
+        <h1 id="welcome-title">Good research.<br>A better book.</h1>
+        <p class="welcome-copy">A writing desk for your next nonfiction book. Start with our UPI guide or your own brief. Read every chapter and shape the final book.</p>
+        <div class="book-cover" aria-label="Pay Me on UPI: How Digital Payments Changed Small Business in India">
+          <div class="cover-top"><span>A practical guide</span><span>3 chapters</span></div>
+          <p class="cover-title">Pay Me<br>on UPI.</p>
+          <div class="cover-bottom"><p>How Digital Payments<br>Changed Small Business in India</p><span class="cover-symbol" aria-hidden="true">₹</span></div>
+        </div>
+        <p class="welcome-note">Real sources. Your review. A book to keep.</p>
+      </div>
+      <div class="auth-panel">
+        <h2 id="auth-title">Welcome back.</h2>
+        <p id="auth-description">Sign in to pick up where you left off.</p>
+        <div class="segmented" aria-label="Account options">
+          <button id="login-mode" type="button" aria-pressed="true">Sign in</button>
+          <button id="register-mode" type="button" aria-pressed="false">Create account</button>
+        </div>
+        <form id="auth-form" aria-describedby="auth-error">
+          <label for="username">Username</label>
+          <input id="username" name="username" autocomplete="username" required maxlength="40" aria-describedby="username-help auth-error">
+          <p id="username-help" class="field-help" hidden>3–40 letters, numbers, underscores, or hyphens.</p>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="128" aria-describedby="password-help auth-error">
+          <p id="password-help" class="field-help" hidden>Use at least 12 characters.</p>
+          <div id="invite-field" hidden>
+            <label for="invite">Registration key</label>
+            <input id="invite" name="invite" type="password" autocomplete="off" aria-describedby="invite-help auth-error">
+            <p id="invite-help" class="field-help">Get this key from the person running the studio.</p>
+          </div>
+          <p id="auth-error" class="error-message" role="alert" hidden></p>
+          <button id="auth-submit" class="primary wide" type="submit">Sign in</button>
+        </form>
+        <p class="auth-note">Your books belong to your account.<br>Each chapter waits for your approval.</p>
+      </div>
+    </section>
+    <section id="workspace" class="workspace" aria-label="Book workspace" hidden>
+      <aside class="sidebar" aria-labelledby="books-title">
+        <div class="sidebar-heading"><h1 id="books-title">Your books</h1><button id="refresh" class="quiet" type="button">Refresh</button></div>
+        <button id="new-book" class="primary wide" type="button">+ New default book</button>
+        <p class="sidebar-note">UPI is the included default brief.</p>
+        <details id="custom-book" class="custom-book">
+          <summary>Use a custom brief</summary>
+          <form id="book-form">
+            <label for="book-brief">Book brief</label>
+            <textarea id="book-brief" rows="7" maxlength="20000" required aria-describedby="brief-help" placeholder="Title: Your book title&#10;Audience: Who is this for?&#10;Topic, purpose, tone, and topics to include or avoid."></textarea>
+            <p id="brief-help" class="field-help">Three chapters of 600–900 words, with sources and your review. Up to 20,000 characters.</p>
+            <button id="custom-start" class="secondary wide" type="submit">Start custom book</button>
+          </form>
+        </details>
+        <nav id="job-list" aria-label="Recent books"></nav>
+        <p id="list-note" class="field-help"></p>
+        <div class="sidebar-footer"><span class="small-book" aria-hidden="true">3</span><p>Three cited chapters.<br>Your topic, your review.</p><a href="/docs" target="_blank" rel="noopener">API reference</a></div>
+      </aside>
+      <div class="desk">
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+        <div id="workspace-error" class="error-message" role="alert" hidden></div>
+        <section id="empty-desk" class="empty-desk">
+          <span class="empty-book" aria-hidden="true">3</span>
+          <h2>A new book starts here.</h2>
+          <p>Research, writing, and checks happen one chapter at a time. You make the final call.</p>
+          <button id="empty-new-book" class="primary" type="button">Start your first book</button>
+        </section>
+        <section id="book-desk" aria-labelledby="book-title" hidden>
+          <div class="book-heading">
+            <div><p id="book-date" class="book-date"></p><h2 id="book-title">Your book</h2><p class="book-subtitle">Three chapters. Researched and reviewed.</p></div>
+            <div class="job-actions"><span id="job-status" class="badge"></span><button id="pause-resume" class="secondary" type="button" hidden>Pause</button></div>
+          </div>
+          <div class="progress-summary"><label for="book-progress" id="progress-label">0 of 3 chapters approved</label><progress id="book-progress" max="3" value="0"></progress></div>
+          <p id="status-description" class="status-description" role="status" aria-live="polite"></p>
+          <div id="job-error" class="error-message" role="alert" hidden></div>
+          <div class="reading-layout">
+            <div class="reading-nav">
+              <h3>Manuscript</h3>
+              <nav id="chapter-nav" aria-label="Manuscript sections"></nav>
+              <div id="final-downloads" class="final-downloads" hidden><h3>Your finished book</h3><button class="primary" type="button" data-download="book.pdf">Download PDF</button><button class="quiet" type="button" data-download="book.md">Download Markdown</button></div>
+            </div>
+            <div class="paper-wrap">
+              <div class="paper-toolbar"><p id="reading-label">Chapter preview</p><button id="chapter-download" class="quiet" type="button" hidden>Download chapter</button></div>
+              <article id="manuscript" class="paper" aria-label="Manuscript preview" aria-busy="false"></article>
+              <section id="review-controls" class="review-controls" aria-labelledby="review-title" hidden>
+                <div class="review-heading"><h3 id="review-title">Your chapter, your call.</h3><p>Approve this chapter to continue, or tell the writer what to change.</p></div>
+                <button id="approve" class="primary" type="button">Approve chapter</button>
+                <form id="feedback-form">
+                  <label for="feedback">Revision feedback</label>
+                  <textarea id="feedback" name="feedback" rows="4" maxlength="2000" required aria-describedby="feedback-help feedback-error" placeholder="Be specific: which passage should change, and why?"></textarea>
+                  <p id="feedback-help" class="field-help">Up to 2,000 characters. Each chapter allows three revision requests.</p>
+                  <p id="feedback-error" class="error-message" role="alert" hidden></p>
+                  <button id="request-revision" class="secondary" type="submit">Request changes</button>
+                </form>
+              </section>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <noscript><p class="error-message">Enable JavaScript to sign in and work with your books. The API reference is available at <a href="/docs">/docs</a>.</p></noscript>
+</body>
+</html>

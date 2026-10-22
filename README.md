@@ -71,6 +71,24 @@ PSTN/SIP-ingress voice agent that answers caller questions by retrieving from a 
 
 ---
 
+### 📚 [Book Studio — Autonomous Book Writer Agent](./book-writer)
+**Cited, multi-chapter autonomous book-writing system with LangGraph, human chapter review, and PDF rendering.**
+
+Production-grade long-form research and writing agent that plans, researches via Tavily, drafts, and verifies multi-chapter manuscripts with citation grounding, human-in-the-loop review, and automated Markdown/PDF export.
+
+**Engineering highlights:**
+- **Hierarchical LangGraph Pipeline**: Coordinated outline planning, iterative research coverage validation, cited drafting, grammar editing, sentence-level fact-checking, and cross-chapter consistency.
+- **Human-in-the-Loop Review**: Authenticated FastAPI web studio with pause/resume gates, chapter feedback loops, and review approvals.
+- **Durable Checkpointing & Job Queue**: SQLite-backed background workers and persistent graph checkpoints for multi-hour book generation resilience.
+- **Evidence-Grounded Fact Checking**: Dedicated fact checker verifies every claim against primary sources, pruning unsupported sentences.
+- **Multi-Format Export**: Automated compilation into structured Markdown and print-ready PDF.
+
+**Stack:** Python 3.11+ · LangGraph · FastAPI · SQLite · Tavily · ReportLab · Vanilla JS / CSS
+
+[→ README + architecture diagram](./book-writer/README.md)
+
+---
+
 ## Philosophy
 
 **"Scalable" means production-ready:**
@@ -83,8 +101,6 @@ PSTN/SIP-ingress voice agent that answers caller questions by retrieving from a 
 - Deployable: Railway/Render/Fly/K8s with zero code changes
 
 **No bloat.** Stdlib first, boring tech, minimal abstractions. Complex where justified (bounded concurrency, multi-stage pipelines, adversarial eval), simple everywhere else.
-
----
 
 ---
 
