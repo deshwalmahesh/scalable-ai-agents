@@ -1,0 +1,34 @@
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Testing & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases & agent persistence (never commit)
+*.db
+*.db-journal
+.agent_artifacts/
+.agent_memory.db
+.agent_store.db
+
+# Secrets & local environment variables (never commit)
+.env
+.env.local
+*.pem
+*.key
+
+# Temporary workspace scratch directories
+scratch/
+scratch_*/
+
+# Distribution & build
+dist/
+build/
+*.egg-info/

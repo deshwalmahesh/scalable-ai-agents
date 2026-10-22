@@ -10,6 +10,27 @@ Each sub-project is a **standalone, deployable system** solving a specific probl
 
 ## Projects
 
+### 💻 [General Coding Agent — On-Device Software Engineer](./general-coding-agent)
+**Autonomous multi-agent pair programmer with cryptographic state safety, boundary sandboxing, and zero external infra dependencies.**
+
+On-device coding agent that inspects, reasons, edits, and tests codebases locally. Built on LangGraph, it runs completely standalone on embedded SQLite, isolating planning from code execution while enforcing strict filesystem and shell safety boundaries.
+
+**Engineering highlights:**
+- **Zero External Infra**: Embedded SQLite (`AsyncSqliteSaver` + `AsyncSqliteStore`) — no Redis, no external vector database servers, no Docker required for basic execution.
+- **Hierarchical Multi-Agent Architecture**: Supervisor routes between an isolated `planner` (read-only) and `coder` (execution).
+- **Pre-Flight AST & OS Sandboxing**: Pre-flight syntax validation prevents command substitutions and background escapes; macOS Seatbelt / Linux Bubblewrap jail mutations strictly inside `workspace_root`.
+- **Fuzzy Whitespace-Tolerant Patching**: `fs_edit` handles trailing whitespace differences and nested indentation shifts with zero code corruption, failing closed on ambiguity.
+- **Cryptographic HIL Approvals**: Human-in-the-loop approval tickets are bound to canonical argument hashes (`canonical_args_hash`) to prevent tampering across graph pause/resume cycles.
+- **Deterministic Secret Rejection**: Automatically detects and blocks API keys, AWS credentials, and tokens from entering persistent memory.
+- **Bounded Non-Destructive Compaction**: Two-tier memory projection compacts older turns when token watermarks are reached, preserving full message and tool fidelity.
+- **Comprehensive Validation**: 44 end-to-end integration and unit tests covering sandboxing, compaction, recovery, and tool execution.
+
+**Stack:** Python 3.12 · LangGraph · LangChain · SQLite (`aiosqlite`) · Any LLM (Gemini / Claude / OpenAI / Local vLLM/Ollama)
+
+[→ README + architecture diagram](./general-coding-agent/README.md)
+
+---
+
 ### 📄 [DocuMind — Text RAG Agent](./text-rag-agent)
 **Document-grounded conversational assistant with live grounding evaluation.**
 
@@ -70,6 +91,12 @@ PSTN/SIP-ingress voice agent that answers caller questions by retrieving from a 
 Each project is self-contained — navigate to its directory and follow its README.
 
 ```bash
+# General Coding Agent (On-Device)
+cd general-coding-agent
+cp .env.example .env # fill in GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY
+uv sync
+uv run python main.py
+
 # Text RAG Agent
 cd text-rag-agent
 export GEMINI_API_KEY=your_key
